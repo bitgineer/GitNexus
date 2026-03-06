@@ -82,12 +82,12 @@ To configure MCP for your editor, run `npx gitnexus setup` once — or set it up
 
 | Editor                | MCP | Skills | Hooks (auto-augment) | Support        |
 | --------------------- | --- | ------ | -------------------- | -------------- |
-| **Claude Code** | Yes | Yes    | Yes (PreToolUse)     | **Full** |
+| **Claude Code** | Yes | Yes    | Yes (PreToolUse + PostToolUse) | **Full** |
 | **Cursor**      | Yes | Yes    | —                   | MCP + Skills   |
 | **Windsurf**    | Yes | —     | —                   | MCP            |
 | **OpenCode**    | Yes | Yes    | —                   | MCP + Skills   |
 
-> **Claude Code** gets the deepest integration: MCP tools + agent skills + PreToolUse hooks that automatically enrich grep/glob/bash calls with knowledge graph context.
+> **Claude Code** gets the deepest integration: MCP tools + agent skills + PreToolUse hooks that enrich searches with graph context + PostToolUse hooks that auto-reindex after commits.
 
 ### Community Integrations
 

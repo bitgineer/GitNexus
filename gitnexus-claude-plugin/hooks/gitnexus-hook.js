@@ -83,63 +83,144 @@ function extractPattern(toolName, toolInput) {
   return null;
 }
 
+/**
+ * Spawn a gitnexus CLI command synchronously.
+ * Chooses launcher once (direct binary or npx), then runs exactly once.
+ */
+function runGitNexusCli(args, cwd, timeout) {
+  const isWin = process.platform === 'win32';
+
+  // Detect whether 'gitnexus' is on PATH (cheap check, no execution)
+  let useDirectBinary = false;
+  try {
+    const which = spawnSync(
+      isWin ? 'where' : 'which', ['gitnexus'],
+      { encoding: 'utf-8', timeout: 3000, stdio: ['pipe', 'pipe', 'pipe'] }
+    );
+    useDirectBinary = which.status === 0;
+  } catch { /* not on PATH */ }
+
+  if (useDirectBinary) {
+    return spawnSync(
+      'gitnexus', args,
+      { encoding: 'utf-8', timeout, cwd, stdio: ['pipe', 'pipe', 'pipe'], shell: isWin }
+    );
+  }
+  return spawnSync(
+    'npx', ['-y', 'gitnexus', ...args],
+    { encoding: 'utf-8', timeout: timeout + 5000, cwd, stdio: ['pipe', 'pipe', 'pipe'], shell: isWin }
+  );
+}
+
+/**
+ * Find .gitnexus directory path (not just boolean).
+ */
+function findGitNexusDir(startDir) {
+  let dir = startDir || process.cwd();
+  for (let i = 0; i < 5; i++) {
+    const candidate = path.join(dir, '.gitnexus');
+    if (fs.existsSync(candidate)) return candidate;
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return null;
+}
+
+/**
+ * PreToolUse handler — augment searches with graph context.
+ */
+function handlePreToolUse(input) {
+  const cwd = input.cwd || process.cwd();
+  if (!findGitNexusIndex(cwd)) return;
+
+  const toolName = input.tool_name || '';
+  const toolInput = input.tool_input || {};
+
+  if (toolName !== 'Grep' && toolName !== 'Glob' && toolName !== 'Bash') return;
+
+  const pattern = extractPattern(toolName, toolInput);
+  if (!pattern || pattern.length < 3) return;
+
+  let result = '';
+  try {
+    const child = runGitNexusCli(['augment', '--', pattern], cwd, 8000);
+    if (!child.error && child.status === 0) {
+      result = child.stderr || '';
+    }
+  } catch { /* graceful failure */ }
+
+  if (result && result.trim()) {
+    console.log(JSON.stringify({
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        additionalContext: result.trim()
+      }
+    }));
+  }
+}
+
+function emitPostToolContext(message) {
+  console.log(JSON.stringify({
+    hookSpecificOutput: {
+      hookEventName: 'PostToolUse',
+      additionalContext: message
+    }
+  }));
+}
+
+/**
+ * PostToolUse handler — auto-reindex after git commit.
+ */
+function handlePostToolUse(input) {
+  const toolName = input.tool_name || '';
+  if (toolName !== 'Bash') return;
+
+  const command = (input.tool_input || {}).command || '';
+  if (!/\bgit\s+(commit|merge)(\s|$)/.test(command)) return;
+
+  const toolOutput = input.tool_output || {};
+  if (toolOutput.exit_code !== undefined && toolOutput.exit_code !== 0) return;
+
+  const cwd = input.cwd || process.cwd();
+  const gitNexusDir = findGitNexusDir(cwd);
+  if (!gitNexusDir) return;
+
+  // Check if embeddings were previously generated
+  let hadEmbeddings = false;
+  try {
+    const meta = JSON.parse(fs.readFileSync(path.join(gitNexusDir, 'meta.json'), 'utf-8'));
+    hadEmbeddings = (meta.stats && meta.stats.embeddings > 0);
+  } catch { /* no meta — still reindex */ }
+
+  const args = ['analyze'];
+  if (hadEmbeddings) args.push('--embeddings');
+
+  const analyzeCmd = `npx gitnexus analyze${hadEmbeddings ? ' --embeddings' : ''}`;
+  const child = runGitNexusCli(args, cwd, 120000);
+
+  if (child.error) {
+    const reason = child.signal ? 'timed out' : child.error.code || 'failed';
+    emitPostToolContext(`GitNexus auto-reindex ${reason}. Run \`${analyzeCmd}\` manually.`);
+    return;
+  }
+
+  if (child.status === 0) {
+    emitPostToolContext(`GitNexus index updated after commit.${hadEmbeddings ? ' Embeddings regenerated.' : ''}`);
+  } else {
+    emitPostToolContext(`GitNexus auto-reindex failed (exit ${child.status}). Run \`${analyzeCmd}\` manually.`);
+  }
+}
+
 function main() {
   try {
     const input = readInput();
     const hookEvent = input.hook_event_name || '';
 
-    if (hookEvent !== 'PreToolUse') return;
-
-    const cwd = input.cwd || process.cwd();
-    if (!findGitNexusIndex(cwd)) return;
-
-    const toolName = input.tool_name || '';
-    const toolInput = input.tool_input || {};
-
-    if (toolName !== 'Grep' && toolName !== 'Glob' && toolName !== 'Bash') return;
-
-    const pattern = extractPattern(toolName, toolInput);
-    if (!pattern || pattern.length < 3) return;
-
-    // augment CLI writes result to stderr (KuzuDB's native module captures
-    // stdout fd at OS level, making it unusable in subprocess contexts).
-    let result = '';
-
-    const isWin = process.platform === 'win32';
-
-    // Try direct gitnexus binary first (faster if globally installed)
-    try {
-      const child = spawnSync(
-        'gitnexus',
-        ['augment', pattern],
-        { encoding: 'utf-8', timeout: 8000, cwd, stdio: ['pipe', 'pipe', 'pipe'], shell: isWin }
-      );
-      if (child.status === 0 && child.stderr && child.stderr.trim()) {
-        result = child.stderr;
-      }
-    } catch { /* not on PATH */ }
-
-    // Fallback to npx if direct binary didn't produce output
-    if (!result || !result.trim()) {
-      try {
-        const child = spawnSync(
-          'npx',
-          ['-y', 'gitnexus', 'augment', pattern],
-          { encoding: 'utf-8', timeout: 15000, cwd, stdio: ['pipe', 'pipe', 'pipe'], shell: isWin }
-        );
-        if (child.status === 0 && child.stderr && child.stderr.trim()) {
-          result = child.stderr;
-        }
-      } catch { /* graceful failure */ }
-    }
-
-    if (result && result.trim()) {
-      console.log(JSON.stringify({
-        hookSpecificOutput: {
-          hookEventName: 'PreToolUse',
-          additionalContext: result.trim()
-        }
-      }));
+    if (hookEvent === 'PreToolUse') {
+      handlePreToolUse(input);
+    } else if (hookEvent === 'PostToolUse') {
+      handlePostToolUse(input);
     }
   } catch {
     // Graceful failure
