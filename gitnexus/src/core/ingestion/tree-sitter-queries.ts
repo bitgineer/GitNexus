@@ -141,6 +141,13 @@ export const PYTHON_QUERIES = `
   function: (attribute
     attribute: (identifier) @call.name)) @call
 
+; Module-level singleton instances: service = ServiceClass()
+(module
+  (expression_statement
+    (assignment
+      left: (identifier) @name
+      right: (call))) @definition.instance)
+
 ; Heritage queries - Python class inheritance
 (class_definition
   name: (identifier) @heritage.class

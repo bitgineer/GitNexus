@@ -42,6 +42,7 @@ const DEFINITION_CAPTURE_KEYS = [
   'definition.annotation',
   'definition.constructor',
   'definition.template',
+  'definition.instance',
 ] as const;
 
 const getDefinitionNodeFromCaptures = (captureMap: Record<string, any>): any | null => {
@@ -365,6 +366,7 @@ const processParsingSequential = async (
       else if (captureMap['definition.annotation']) nodeLabel = 'Annotation';
       else if (captureMap['definition.constructor']) nodeLabel = 'Constructor';
       else if (captureMap['definition.template']) nodeLabel = 'Template';
+      else if (captureMap['definition.instance']) nodeLabel = 'CodeElement';
 
       const definitionNodeForRange = getDefinitionNodeFromCaptures(captureMap);
       const startLine = definitionNodeForRange ? definitionNodeForRange.startPosition.row : (nameNode ? nameNode.startPosition.row : 0);

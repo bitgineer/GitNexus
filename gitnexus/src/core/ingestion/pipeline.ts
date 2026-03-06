@@ -192,7 +192,7 @@ export const runPipelineFromRepo = async (
 
         if (chunkWorkerData) {
           // Imports
-          await processImportsFromExtracted(graph, allPathObjects, chunkWorkerData.imports, importMap, undefined, repoPath, importCtx);
+          await processImportsFromExtracted(graph, allPathObjects, chunkWorkerData.imports, importMap, undefined, repoPath, importCtx, symbolTable);
           // Calls — resolve immediately, then free the array
           if (chunkWorkerData.calls.length > 0) {
             await processCallsFromExtracted(graph, chunkWorkerData.calls, symbolTable, importMap);
@@ -206,7 +206,7 @@ export const runPipelineFromRepo = async (
             await processRoutesFromExtracted(graph, chunkWorkerData.routes, symbolTable, importMap);
           }
         } else {
-          await processImports(graph, chunkFiles, astCache, importMap, undefined, repoPath, allPaths);
+          await processImports(graph, chunkFiles, astCache, importMap, undefined, repoPath, allPaths, symbolTable);
           sequentialChunkPaths.push(chunkPaths);
         }
 
