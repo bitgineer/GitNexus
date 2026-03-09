@@ -185,28 +185,58 @@ const isNodeExported = (node: any, name: string, language: string): boolean => {
       }
       return false;
 
-    case 'csharp':
+    case 'csharp': {
+      // In C# AST, `modifier` nodes are SIBLINGS of the name node inside the
+      // declaration (e.g. method_declaration, class_declaration). Walking up
+      // from the name node reaches the declaration, then we check its children.
+      const CSHARP_DECL_TYPES = new Set([
+        'method_declaration', 'local_function_statement', 'constructor_declaration',
+        'class_declaration', 'interface_declaration', 'struct_declaration',
+        'enum_declaration', 'record_declaration', 'delegate_declaration',
+        'property_declaration', 'field_declaration', 'event_declaration',
+        'namespace_declaration',
+      ]);
       while (current) {
-        if (current.type === 'modifier' || current.type === 'modifiers') {
-          if (current.text?.includes('public')) return true;
+        if (CSHARP_DECL_TYPES.has(current.type)) {
+          // Check siblings: any child of the declaration that is a modifier with text 'public'
+          for (let i = 0; i < current.childCount; i++) {
+            const child = current.child(i);
+            if (child?.type === 'modifier' && child.text === 'public') return true;
+          }
+          return false;
         }
         current = current.parent;
       }
       return false;
+    }
 
     case 'go':
       if (name.length === 0) return false;
       const first = name[0];
       return first === first.toUpperCase() && first !== first.toLowerCase();
 
-    case 'rust':
+    case 'rust': {
+      // In Rust AST, `visibility_modifier` is a SIBLING of the name node (identifier/type_identifier)
+      // within the declaration node (function_item, struct_item, impl_item, etc.).
+      // Walking up parents from the name node will never hit `visibility_modifier` directly.
+      // Fix: walk up to the declaration node, then check its children for visibility_modifier.
+      const RUST_DECL_TYPES = new Set([
+        'function_item', 'struct_item', 'enum_item', 'trait_item', 'impl_item',
+        'type_item', 'const_item', 'static_item', 'mod_item', 'use_declaration',
+        'associated_type', 'function_signature_item',
+      ]);
       while (current) {
-        if (current.type === 'visibility_modifier') {
-          if (current.text?.includes('pub')) return true;
+        if (RUST_DECL_TYPES.has(current.type)) {
+          for (let i = 0; i < current.childCount; i++) {
+            const child = current.child(i);
+            if (child?.type === 'visibility_modifier' && child.text?.startsWith('pub')) return true;
+          }
+          return false;
         }
         current = current.parent;
       }
       return false;
+    }
 
     // Kotlin: Default visibility is public (unlike Java)
     // visibility_modifier is inside modifiers, a sibling of the name node within the declaration
@@ -225,9 +255,22 @@ const isNodeExported = (node: any, name: string, language: string): boolean => {
       // No visibility modifier = public (Kotlin default)
       return true;
 
+    // C/C++: Functions without 'static' storage class have external linkage
+    // by default, making them globally accessible (equivalent to exported).
+    // Only functions explicitly marked 'static' are file-scoped (not exported).
     case 'c':
-    case 'cpp':
-      return false;
+    case 'cpp': {
+      let cur = node;
+      while (cur) {
+        if (cur.type === 'function_definition' || cur.type === 'declaration') {
+          const declText: string = (cur.text || '').split('{')[0].split(';')[0];
+          if (/\bstatic\b/.test(declText)) return false;
+          return true;
+        }
+        cur = cur.parent;
+      }
+      return true;
+    }
 
     case 'php':
       // Top-level classes/interfaces/traits are always accessible
@@ -297,9 +340,46 @@ const findEnclosingFunctionId = (node: any, filePath: string): string | null => 
 
       if (['function_declaration', 'function_definition', 'async_function_declaration',
            'generator_function_declaration', 'function_item'].includes(current.type)) {
+        // Try direct name field (JS/TS/Python/Rust)
         const nameNode = current.childForFieldName?.('name') ||
           current.children?.find((c: any) => c.type === 'identifier' || c.type === 'property_identifier');
-        funcName = nameNode?.text;
+        if (nameNode) {
+          funcName = nameNode.text;
+          // C++ template functions: function_definition inside template_declaration
+          // are registered as 'Template' nodes (not 'Function'), so match that label.
+          if (current.type === 'function_definition' && current.parent?.type === 'template_declaration') {
+            label = 'Template';
+          }
+        } else {
+          // C/C++: name is nested in declarator -> function_declarator -> identifier/qualified_identifier
+          const declarator = current.childForFieldName?.('declarator');
+          if (declarator) {
+            const innerDecl = declarator.childForFieldName?.('declarator');
+            if (innerDecl?.type === 'identifier') {
+              funcName = innerDecl.text;
+              // Template function with qualified-style declarator (rare, but check)
+              if (current.parent?.type === 'template_declaration') {
+                label = 'Template';
+              }
+            } else if (innerDecl?.type === 'qualified_identifier') {
+              // C++ qualified name: Foo::bar — captured as 'Method' node
+              const nameIdent = innerDecl.childForFieldName?.('name') ||
+                innerDecl.children?.find((c: any) => c.type === 'identifier');
+              funcName = nameIdent?.text;
+              label = 'Method'; // qualified_identifier => registered as Method
+            } else if (innerDecl?.type === 'field_identifier') {
+              // C++ inline method with body inside class: void myMethod() { ... }
+              // The function_definition is a direct child of field_declaration_list.
+              // Name node is field_identifier, registered as 'Method'.
+              funcName = innerDecl.text;
+              label = 'Method';
+            } else if (innerDecl?.type === 'operator_name') {
+              // C++ operator overload inside class body: operator[]
+              funcName = innerDecl.text;
+              label = 'Method';
+            }
+          }
+        }
       } else if (current.type === 'impl_item') {
         const funcItem = current.children?.find((c: any) => c.type === 'function_item');
         if (funcItem) {
@@ -359,7 +439,8 @@ const BUILT_INS = new Set([
   'hasOwnProperty', 'toString', 'valueOf',
   // Python
   'print', 'len', 'range', 'str', 'int', 'float', 'list', 'dict', 'set', 'tuple',
-  'open', 'read', 'write', 'close', 'append', 'extend', 'update',
+  'append', 'extend', 'update',
+  // NOTE: 'open', 'read', 'write', 'close' removed — these are real C POSIX syscalls
   'super', 'type', 'isinstance', 'issubclass', 'getattr', 'setattr', 'hasattr',
   'enumerate', 'zip', 'sorted', 'reversed', 'min', 'max', 'sum', 'abs',
   // Kotlin stdlib (IMPORTANT: keep in sync with call-processor.ts BUILT_IN_NAMES)
@@ -1109,7 +1190,10 @@ const processFileGroup = (
 
     let tree;
     try {
-      tree = parser.parse(file.content, undefined, { bufferSize: 1024 * 256 });
+      // bufferSize must be >= file size. Use 2× file size, minimum 512KB, maximum 32MB.
+      const fileSizeBytes = Buffer.byteLength(file.content, 'utf8');
+      const bufSize = Math.min(Math.max(fileSizeBytes * 2, 512 * 1024), 32 * 1024 * 1024);
+      tree = parser.parse(file.content, undefined, { bufferSize: bufSize });
     } catch {
       continue;
     }

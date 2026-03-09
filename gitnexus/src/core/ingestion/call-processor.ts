@@ -75,10 +75,43 @@ const findEnclosingFunction = (
           current.type === 'async_function_declaration' ||
           current.type === 'generator_function_declaration' ||
           current.type === 'function_item') { // Rust function
-        // Named function: function foo() {}
+        // Try direct name field (JS/TS/Python/Rust)
         const nameNode = current.childForFieldName?.('name') || 
                          current.children?.find((c: any) => c.type === 'identifier' || c.type === 'property_identifier');
-        funcName = nameNode?.text;
+        if (nameNode) {
+          funcName = nameNode.text;
+          // C++ template functions: function_definition inside template_declaration
+          // are registered as 'Template' nodes (not 'Function'), so match that label.
+          if (current.type === 'function_definition' && current.parent?.type === 'template_declaration') {
+            label = 'Template';
+          }
+        } else {
+          // C/C++: name nested inside declarator -> function_declarator -> identifier
+          const declarator = current.childForFieldName?.('declarator');
+          if (declarator) {
+            const innerDecl = declarator.childForFieldName?.('declarator');
+            if (innerDecl?.type === 'identifier') {
+              funcName = innerDecl.text;
+              // Template function with declarator-style name
+              if (current.parent?.type === 'template_declaration') {
+                label = 'Template';
+              }
+            } else if (innerDecl?.type === 'qualified_identifier') {
+              const nameIdent = innerDecl.childForFieldName?.('name') ||
+                innerDecl.children?.find((c: any) => c.type === 'identifier');
+              funcName = nameIdent?.text;
+              label = 'Method'; // qualified_identifier => registered as Method
+            } else if (innerDecl?.type === 'field_identifier') {
+              // C++ inline method with body inside class: void myMethod() { ... }
+              funcName = innerDecl.text;
+              label = 'Method';
+            } else if (innerDecl?.type === 'operator_name') {
+              // C++ operator overload inside class body: operator[]
+              funcName = innerDecl.text;
+              label = 'Method';
+            }
+          }
+        }
       } else if (current.type === 'impl_item') {
         // Rust method inside impl block: wrapper around function_item or const_item
         // We need to look inside for the function_item
@@ -325,7 +358,8 @@ const BUILT_IN_NAMES = new Set([
   'hasOwnProperty', 'toString', 'valueOf',
   // Python built-ins
   'print', 'len', 'range', 'str', 'int', 'float', 'list', 'dict', 'set', 'tuple',
-  'open', 'read', 'write', 'close', 'append', 'extend', 'update',
+  'append', 'extend', 'update',
+  // NOTE: 'open', 'read', 'write', 'close' removed — these are real C POSIX syscalls
   'super', 'type', 'isinstance', 'issubclass', 'getattr', 'setattr', 'hasattr',
   'enumerate', 'zip', 'sorted', 'reversed', 'min', 'max', 'sum', 'abs',
   // Kotlin stdlib (IMPORTANT: keep in sync with parse-worker.ts BUILT_IN_NAMES)

@@ -133,14 +133,27 @@ export const isNodeExported = (node: any, name: string, language: string): boole
       return first === first.toUpperCase() && first !== first.toLowerCase();
 
     // Rust: Check for 'pub' visibility modifier
-    case 'rust':
+    // In Rust AST, `visibility_modifier` is a SIBLING of the name node within the
+    // declaration node (function_item, struct_item, etc.), not a parent of it.
+    // Fix: walk up to the declaration node, then scan its direct children.
+    case 'rust': {
+      const RUST_DECL_TYPES = new Set([
+        'function_item', 'struct_item', 'enum_item', 'trait_item', 'impl_item',
+        'type_item', 'const_item', 'static_item', 'mod_item', 'use_declaration',
+        'associated_type', 'function_signature_item',
+      ]);
       while (current) {
-        if (current.type === 'visibility_modifier') {
-          if (current.text?.includes('pub')) return true;
+        if (RUST_DECL_TYPES.has(current.type)) {
+          for (let i = 0; i < current.childCount; i++) {
+            const child = current.child(i);
+            if (child?.type === 'visibility_modifier' && child.text?.startsWith('pub')) return true;
+          }
+          return false;
         }
         current = current.parent;
       }
       return false;
+    }
 
     // Kotlin: Default visibility is public (unlike Java)
     // visibility_modifier is inside modifiers, a sibling of the name node within the declaration
@@ -159,11 +172,25 @@ export const isNodeExported = (node: any, name: string, language: string): boole
       // No visibility modifier = public (Kotlin default)
       return true;
 
-    // C/C++: No native export concept at language level
-    // Entry points will be detected via name patterns (main, etc.)
+    // C/C++: Functions without 'static' storage class have external linkage
+    // by default, making them globally accessible (equivalent to exported).
+    // Only functions explicitly marked 'static' are file-scoped (not exported).
     case 'c':
-    case 'cpp':
-      return false;
+    case 'cpp': {
+      // Walk up to the function_definition/declaration and check for 'static'
+      let cur = node;
+      while (cur) {
+        if (cur.type === 'function_definition' || cur.type === 'declaration') {
+          // Check text before the opening brace (or semicolon) for 'static'
+          const declText: string = (cur.text || '').split('{')[0].split(';')[0];
+          // 'static' as a storage class (not 'static_assert' etc.)
+          if (/\bstatic\b/.test(declText)) return false;
+          return true; // No 'static' = external linkage = exported
+        }
+        cur = cur.parent;
+      }
+      return true; // Top-level C/C++ functions default to external linkage
+    }
 
     // Swift: Check for 'public' or 'open' access modifiers
     case 'swift':
@@ -297,7 +324,10 @@ const processParsingSequential = async (
 
     let tree;
     try {
-      tree = parser.parse(file.content, undefined, { bufferSize: 1024 * 256 });
+      // bufferSize must be >= file size. Use 2× file size, minimum 512KB, maximum 32MB.
+      const fileSizeBytes = Buffer.byteLength(file.content, 'utf8');
+      const bufSize = Math.min(Math.max(fileSizeBytes * 2, 512 * 1024), 32 * 1024 * 1024);
+      tree = parser.parse(file.content, undefined, { bufferSize: bufSize });
     } catch (parseError) {
       console.warn(`Skipping unparseable file: ${file.path}`);
       continue;

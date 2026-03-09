@@ -37,11 +37,13 @@ export const getLanguageFromFilename = (filename: string): SupportedLanguages | 
   if (filename.endsWith('.py')) return SupportedLanguages.Python;
   // Java
   if (filename.endsWith('.java')) return SupportedLanguages.Java;
-  // C (source and headers)
-  if (filename.endsWith('.c') || filename.endsWith('.h')) return SupportedLanguages.C;
-  // C++ (all common extensions)
+  // C source files
+  if (filename.endsWith('.c')) return SupportedLanguages.C;
+  // C++ (all common extensions, including .h)
+  // .h is parsed as C++ because tree-sitter-cpp is a strict superset of C, so pure-C
+  // headers parse correctly, and C++ headers (classes, templates) are handled properly.
   if (filename.endsWith('.cpp') || filename.endsWith('.cc') || filename.endsWith('.cxx') ||
-      filename.endsWith('.hpp') || filename.endsWith('.hxx') || filename.endsWith('.hh')) return SupportedLanguages.CPlusPlus;
+      filename.endsWith('.h') || filename.endsWith('.hpp') || filename.endsWith('.hxx') || filename.endsWith('.hh')) return SupportedLanguages.CPlusPlus;
   // C#
   if (filename.endsWith('.cs')) return SupportedLanguages.CSharp;
   // Go
