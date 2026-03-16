@@ -26,6 +26,8 @@ program
   .description('Index a repository (full analysis)')
   .option('-f, --force', 'Force full re-index even if up to date')
   .option('--embeddings', 'Enable embedding generation for semantic search (off by default)')
+  .option('--no-context', 'Disable generation of CLAUDE.md and AGENTS.md files')
+  .option('--no-skills', 'Disable installation of .claude/skills/gitnexus/ directory')
   .action(createLazyAction(() => import('./analyze.js'), 'analyzeCommand'));
 
 program

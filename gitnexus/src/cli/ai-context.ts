@@ -23,6 +23,11 @@ interface RepoStats {
   processes?: number;
 }
 
+interface AIContextOptions {
+  context?: boolean;
+  skills?: boolean;
+}
+
 const GITNEXUS_START_MARKER = '<!-- gitnexus:start -->';
 const GITNEXUS_END_MARKER = '<!-- gitnexus:end -->';
 
@@ -270,25 +275,30 @@ export async function generateAIContextFiles(
   repoPath: string,
   _storagePath: string,
   projectName: string,
-  stats: RepoStats
+  stats: RepoStats,
+  options: AIContextOptions = { context: true, skills: true }
 ): Promise<{ files: string[] }> {
   const content = generateGitNexusContent(projectName, stats);
   const createdFiles: string[] = [];
 
   // Create AGENTS.md (standard for Cursor, Windsurf, OpenCode, Cline, etc.)
-  const agentsPath = path.join(repoPath, 'AGENTS.md');
-  const agentsResult = await upsertGitNexusSection(agentsPath, content);
-  createdFiles.push(`AGENTS.md (${agentsResult})`);
+  if (options.context !== false) {
+    const agentsPath = path.join(repoPath, 'AGENTS.md');
+    const agentsResult = await upsertGitNexusSection(agentsPath, content);
+    createdFiles.push(`AGENTS.md (${agentsResult})`);
 
-  // Create CLAUDE.md (for Claude Code)
-  const claudePath = path.join(repoPath, 'CLAUDE.md');
-  const claudeResult = await upsertGitNexusSection(claudePath, content);
-  createdFiles.push(`CLAUDE.md (${claudeResult})`);
+    // Create CLAUDE.md (for Claude Code)
+    const claudePath = path.join(repoPath, 'CLAUDE.md');
+    const claudeResult = await upsertGitNexusSection(claudePath, content);
+    createdFiles.push(`CLAUDE.md (${claudeResult})`);
+  }
 
   // Install skills to .claude/skills/gitnexus/
-  const installedSkills = await installSkills(repoPath);
-  if (installedSkills.length > 0) {
-    createdFiles.push(`.claude/skills/gitnexus/ (${installedSkills.length} skills)`);
+  if (options.skills !== false) {
+    const installedSkills = await installSkills(repoPath);
+    if (installedSkills.length > 0) {
+      createdFiles.push(`.claude/skills/gitnexus/ (${installedSkills.length} skills)`);
+    }
   }
 
   return { files: createdFiles };

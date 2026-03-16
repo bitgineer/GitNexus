@@ -45,6 +45,8 @@ function ensureHeap(): boolean {
 export interface AnalyzeOptions {
   force?: boolean;
   embeddings?: boolean;
+  context?: boolean;
+  skills?: boolean;
 }
 
 /** Threshold: auto-skip embeddings for repos with more nodes than this */
@@ -318,6 +320,9 @@ export const analyzeCommand = async (
     communities: pipelineResult.communityResult?.stats.totalCommunities,
     clusters: aggregatedClusterCount,
     processes: pipelineResult.processResult?.stats.totalProcesses,
+  }, {
+    context: options?.context !== false,
+    skills: options?.skills !== false,
   });
 
   await closeKuzu();
