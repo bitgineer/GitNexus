@@ -284,6 +284,9 @@ export const loadGraphToLbug = async (
           await conn.query(retryQuery);
         } catch (retryErr) {
           const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
+          if (process.env.GITNEXUS_VERBOSE) {
+            console.error(`  ⚠️ COPY failed for ${fromLabel}->${toLabel} (${lines.length} edges): ${retryMsg.slice(0, 200)}`);
+          }
           warnings.push(`${fromLabel}->${toLabel} (${lines.length} edges): ${retryMsg.slice(0, 80)}`);
           failedPairEdges += lines.length;
           failedPairLines.push(...lines);
@@ -343,27 +346,30 @@ const fallbackRelationshipInserts = async (
     return BACKTICK_TABLES.has(label) ? `\`${label}\`` : label;
   };
 
+  const esc = (s: string) => s.replace(/'/g, "''").replace(/\\/g, '\\\\').replace(/\n/g, '\\n').replace(/\r/g, '\\r');
   for (let i = 1; i < validRelLines.length; i++) {
     const line = validRelLines[i];
+    const match = line.match(/"([^"]*)","([^"]*)","([^"]*)",([0-9.]+),"([^"]*)",([0-9-]+)/);
+    if (!match) continue;
+    const [, fromId, toId, relType, confidenceStr, reason, stepStr] = match;
+    const fromLabel = getNodeLabel(fromId);
+    const toLabel = getNodeLabel(toId);
+    if (!validTables.has(fromLabel) || !validTables.has(toLabel)) continue;
+
+    const confidence = parseFloat(confidenceStr) || 1.0;
+    const step = parseInt(stepStr) || 0;
+
     try {
-      const match = line.match(/"([^"]*)","([^"]*)","([^"]*)",([0-9.]+),"([^"]*)",([0-9-]+)/);
-      if (!match) continue;
-      const [, fromId, toId, relType, confidenceStr, reason, stepStr] = match;
-      const fromLabel = getNodeLabel(fromId);
-      const toLabel = getNodeLabel(toId);
-      if (!validTables.has(fromLabel) || !validTables.has(toLabel)) continue;
-
-      const confidence = parseFloat(confidenceStr) || 1.0;
-      const step = parseInt(stepStr) || 0;
-
-      const esc = (s: string) => s.replace(/'/g, "''").replace(/\\/g, '\\\\').replace(/\n/g, '\\n').replace(/\r/g, '\\r');
       await conn.query(`
         MATCH (a:${escapeLabel(fromLabel)} {id: '${esc(fromId)}' }),
               (b:${escapeLabel(toLabel)} {id: '${esc(toId)}' })
         CREATE (a)-[:${REL_TABLE_NAME} {type: '${esc(relType)}', confidence: ${confidence}, reason: '${esc(reason)}', step: ${step}}]->(b)
       `);
-    } catch {
-      // skip
+    } catch (e) {
+      if (process.env.GITNEXUS_VERBOSE) {
+        const msg = e instanceof Error ? e.message : String(e);
+        console.error(`  ⚠️ Fallback INSERT failed: ${escapeLabel(fromLabel)}(${fromId.slice(0,60)}) -> ${escapeLabel(toLabel)}(${toId.slice(0,60)}): ${msg.slice(0, 150)}`);
+      }
     }
   }
 };

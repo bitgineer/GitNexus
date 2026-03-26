@@ -1257,13 +1257,14 @@ export const processCallsFromExtracted = async (
       if (!resolved) continue;
 
       const relId = generateId('CALLS', `${effectiveCall.sourceId}:${effectiveCall.calledName}->${resolved.nodeId}`);
+      const reason = effectiveCall.isAwaited ? `${resolved.reason}:await` : resolved.reason;
       graph.addRelationship({
         id: relId,
         sourceId: effectiveCall.sourceId,
         targetId: resolved.nodeId,
         type: 'CALLS',
         confidence: resolved.confidence,
-        reason: resolved.reason,
+        reason,
       });
     }
 
