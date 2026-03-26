@@ -82,6 +82,10 @@ export type NodeProperties = {
   errorKeys?: string[],
   // Middleware wrapper chain (outermost first): ['withRateLimit', 'withCSRF', 'withAuth']
   middleware?: string[],
+  // C# namespace for partial class unification
+  namespace?: string,
+  // Whether this function/method is async
+  isAsync?: boolean,
 }
 
 export type RelationshipType =
