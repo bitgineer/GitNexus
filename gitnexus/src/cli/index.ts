@@ -123,7 +123,7 @@ program
 
 program
   .command('link')
-  .description('Build cross-repo channel index — matches message producers to consumers across repositories')
+  .description('Build cross-repo channel index — matches message producers to consumers across repositories (TS/JS/C#/Python/Java/PHP/Go/Ruby/Swift)')
   .action(createLazyAction(() => import('./link.js'), 'linkCommand'));
 
 // ─── Eval Server (persistent daemon for SWE-bench) ─────────────────

@@ -692,6 +692,108 @@ export const PYTHON_QUERIES = `
       attribute: (identifier) @decorator.name)
     arguments: (argument_list
       (string (string_content) @decorator.arg)?))) @decorator
+
+; ── Message channel captures (Socket.IO, EventEmitter, Celery, Redis) ──────
+
+; Python Socket.IO / EventEmitter producer: obj.emit('event', data)
+(call
+  function: (attribute
+    object: (_) @channel.py.object
+    attribute: (identifier) @_emit_py (#eq? @_emit_py "emit"))
+  arguments: (argument_list
+    (string (string_content) @channel.name))) @channel.producer.py
+
+; Python Socket.IO / EventEmitter consumer: obj.on('event', handler)
+(call
+  function: (attribute
+    object: (_) @channel.py.object
+    attribute: (identifier) @_on_py (#match? @_on_py "^(on|once)$"))
+  arguments: (argument_list
+    (string (string_content) @channel.name))) @channel.consumer.py
+
+; Python decorator listener: @socketio.on('event') or @sio.on('event')
+(decorated_definition
+  (decorator
+    (call
+      function: (attribute
+        object: (identifier) @channel.py.deco.object
+        attribute: (identifier) @_deco_on_py (#eq? @_deco_on_py "on"))
+      arguments: (argument_list
+        (string (string_content) @channel.name))))) @channel.consumer.py.decorator
+
+; Python @sio.event / @socketio.event decorator (event name = function name)
+; NOTE: This captures the decorator so we can detect it, but the channel name
+; is the function name (resolved in parse-worker, not here).
+(decorated_definition
+  (decorator
+    (attribute
+      object: (identifier) @channel.py.event.object
+      attribute: (identifier) @_event_deco (#eq? @_event_deco "event")))
+  definition: (function_definition
+    name: (identifier) @channel.name)) @channel.consumer.py.event
+
+; Celery send_task: app.send_task('dotted.task.name', ...)
+(call
+  function: (attribute
+    attribute: (identifier) @_send_task_py (#eq? @_send_task_py "send_task"))
+  arguments: (argument_list
+    (string (string_content) @channel.name))) @channel.producer.celery
+
+; Celery delay/apply_async via named task: task_name.delay(args) captured as regular call;
+; The cross-reference is via import chain, not string key. We capture send_task only.
+
+; Celery task decorator: @app.task(name='task.name')
+(decorated_definition
+  (decorator
+    (call
+      function: (attribute
+        attribute: (identifier) @_task_deco_py (#eq? @_task_deco_py "task"))
+      arguments: (argument_list
+        (keyword_argument
+          name: (identifier) @_name_kw_py (#eq? @_name_kw_py "name")
+          value: (string (string_content) @channel.name)))))) @channel.consumer.celery
+
+; Celery shared_task decorator: @shared_task(name='task.name')
+(decorated_definition
+  (decorator
+    (call
+      function: (identifier) @_shared_task_py (#eq? @_shared_task_py "shared_task")
+      arguments: (argument_list
+        (keyword_argument
+          name: (identifier) @_name_kw_py2 (#eq? @_name_kw_py2 "name")
+          value: (string (string_content) @channel.name)))))) @channel.consumer.celery
+
+; Redis publish: redis.publish('channel', data)
+(call
+  function: (attribute
+    attribute: (identifier) @_publish_py (#eq? @_publish_py "publish"))
+  arguments: (argument_list
+    (string (string_content) @channel.name))) @channel.producer.redis
+
+; Redis subscribe: pubsub.subscribe('channel') or pubsub.psubscribe('pattern')
+(call
+  function: (attribute
+    attribute: (identifier) @_subscribe_py (#match? @_subscribe_py "^p?subscribe$"))
+  arguments: (argument_list
+    (string (string_content) @channel.name))) @channel.consumer.redis
+
+; Python Socket.IO / EventEmitter with variable: obj.emit(VARIABLE, data)
+(call
+  function: (attribute
+    object: (_) @channel.py.var.object
+    attribute: (identifier) @_emit_var_py (#eq? @_emit_var_py "emit"))
+  arguments: (argument_list
+    .
+    (identifier) @channel.name.var)) @channel.producer.py.var
+
+; Python Socket.IO / EventEmitter consumer with variable: obj.on(VARIABLE, handler)
+(call
+  function: (attribute
+    object: (_) @channel.py.var.object
+    attribute: (identifier) @_on_var_py (#match? @_on_var_py "^(on|once)$"))
+  arguments: (argument_list
+    .
+    (identifier) @channel.name.var)) @channel.consumer.py.var
 `;
 
 // Java queries - works with tree-sitter-java
@@ -735,6 +837,43 @@ export const JAVA_QUERIES = `
     object: (_) @assignment.receiver
     field: (identifier) @assignment.property)
   right: (_)) @assignment
+
+; ── Message channel captures (Kafka, JMS, RabbitMQ) ────────────────────────
+
+; Java method call with string first arg: template.send("topic", msg)
+; Matches kafkaTemplate.send, jmsTemplate.convertAndSend, rabbitTemplate.convertAndSend
+(method_invocation
+  object: (_) @channel.java.object
+  name: (identifier) @channel.java.method
+  arguments: (argument_list
+    (string_literal) @channel.name)) @channel.java
+
+; Java annotation with string attribute value:
+; @KafkaListener(topics = "topic"), @JmsListener(destination = "dest"), @RabbitListener(queues = "queue")
+(annotation
+  name: (identifier) @channel.java.annotation.name
+  arguments: (annotation_argument_list
+    (element_value_pair
+      key: (identifier) @channel.java.annotation.key
+      value: (string_literal) @channel.name))) @channel.java.annotation
+
+; Java annotation with string array attribute:
+; @KafkaListener(topics = {"topic1", "topic2"})
+(annotation
+  name: (identifier) @channel.java.annotation.name
+  arguments: (annotation_argument_list
+    (element_value_pair
+      key: (identifier) @channel.java.annotation.key
+      value: (element_value_array_initializer
+        (string_literal) @channel.name)))) @channel.java.annotation.array
+
+; Java method call with const variable: template.send(TOPIC_NAME, msg)
+(method_invocation
+  object: (_) @channel.java.var.object
+  name: (identifier) @channel.java.var.method
+  arguments: (argument_list
+    .
+    (identifier) @channel.name.var)) @channel.java.var
 `;
 
 // C queries - works with tree-sitter-c
@@ -820,6 +959,38 @@ export const GO_QUERIES = `
   (selector_expression
     operand: (_) @assignment.receiver
     field: (field_identifier) @assignment.property)) @assignment
+
+; ── Message channel captures (NATS pub/sub) ────────────────────────────────
+
+; NATS publish: nc.Publish("subject", data)
+(call_expression
+  function: (selector_expression
+    field: (field_identifier) @_go_publish (#eq? @_go_publish "Publish"))
+  arguments: (argument_list
+    (interpreted_string_literal) @channel.name)) @channel.producer.go
+
+; NATS subscribe: nc.Subscribe("subject", handler)
+(call_expression
+  function: (selector_expression
+    field: (field_identifier) @_go_subscribe (#match? @_go_subscribe "^(Queue)?Subscribe$"))
+  arguments: (argument_list
+    (interpreted_string_literal) @channel.name)) @channel.consumer.go
+
+; NATS publish with variable: nc.Publish(subjectConst, data)
+(call_expression
+  function: (selector_expression
+    field: (field_identifier) @_go_pub_var (#eq? @_go_pub_var "Publish"))
+  arguments: (argument_list
+    .
+    (identifier) @channel.name.var)) @channel.producer.go.var
+
+; NATS subscribe with variable: nc.Subscribe(subjectConst, handler)
+(call_expression
+  function: (selector_expression
+    field: (field_identifier) @_go_sub_var (#match? @_go_sub_var "^(Queue)?Subscribe$"))
+  arguments: (argument_list
+    .
+    (identifier) @channel.name.var)) @channel.consumer.go.var
 `;
 
 // C++ queries - works with tree-sitter-cpp
@@ -1221,6 +1392,78 @@ export const PHP_QUERIES = `
     scope: (_) @assignment.receiver
     name: (variable_name (name) @assignment.property))
   right: (_)) @assignment
+
+; ── Message channel captures (WordPress, Laravel, Symfony) ─────────────────
+
+; WordPress action fire: do_action('hook_name', ...)
+(function_call_expression
+  function: (name) @_wp_do_action (#match? @_wp_do_action "^do_action(_ref_array)?$")
+  arguments: (arguments
+    (argument (string (string_content) @channel.name)))) @channel.producer.wp
+
+; WordPress filter apply: apply_filters('hook_name', value, ...)
+(function_call_expression
+  function: (name) @_wp_apply_filters (#match? @_wp_apply_filters "^apply_filters(_ref_array)?$")
+  arguments: (arguments
+    (argument (string (string_content) @channel.name)))) @channel.producer.wp.filter
+
+; WordPress action listener: add_action('hook_name', callable, ...)
+(function_call_expression
+  function: (name) @_wp_add_action (#eq? @_wp_add_action "add_action")
+  arguments: (arguments
+    (argument (string (string_content) @channel.name)))) @channel.consumer.wp
+
+; WordPress filter listener: add_filter('hook_name', callable, ...)
+(function_call_expression
+  function: (name) @_wp_add_filter (#eq? @_wp_add_filter "add_filter")
+  arguments: (arguments
+    (argument (string (string_content) @channel.name)))) @channel.consumer.wp.filter
+
+; WordPress has_action/has_filter/remove_action/remove_filter:
+; These reference the same hook names — capture as consumers for graph connectivity
+(function_call_expression
+  function: (name) @_wp_ref (#match? @_wp_ref "^(has_action|has_filter|remove_action|remove_filter)$")
+  arguments: (arguments
+    (argument (string (string_content) @channel.name)))) @channel.consumer.wp.ref
+
+; Laravel event dispatch: event('event.name') — string form
+(function_call_expression
+  function: (name) @_laravel_event (#eq? @_laravel_event "event")
+  arguments: (arguments
+    (argument (string (string_content) @channel.name)))) @channel.producer.laravel
+
+; Laravel Event::listen('event.name', handler)
+(scoped_call_expression
+  scope: (name) @_laravel_scope (#eq? @_laravel_scope "Event")
+  name: (name) @_laravel_listen (#eq? @_laravel_listen "listen")
+  arguments: (arguments
+    (argument (string (string_content) @channel.name)))) @channel.consumer.laravel
+
+; Laravel Event::dispatch('event.name')
+(scoped_call_expression
+  scope: (name) @_laravel_scope2 (#eq? @_laravel_scope2 "Event")
+  name: (name) @_laravel_dispatch (#eq? @_laravel_dispatch "dispatch")
+  arguments: (arguments
+    (argument (string (string_content) @channel.name)))) @channel.producer.laravel
+
+; Symfony dispatch with event name: $dispatcher->dispatch($event, 'event.name')
+(member_call_expression
+  name: (name) @_sym_dispatch (#eq? @_sym_dispatch "dispatch")
+  arguments: (arguments
+    (argument)
+    (argument (string (string_content) @channel.name)))) @channel.producer.symfony
+
+; Symfony addListener: $dispatcher->addListener('event.name', callable)
+(member_call_expression
+  name: (name) @_sym_addlistener (#eq? @_sym_addlistener "addListener")
+  arguments: (arguments
+    (argument (string (string_content) @channel.name)))) @channel.consumer.symfony
+
+; Symfony removeListener: $dispatcher->removeListener('event.name', callable)
+(member_call_expression
+  name: (name) @_sym_removelistener (#eq? @_sym_removelistener "removeListener")
+  arguments: (arguments
+    (argument (string (string_content) @channel.name)))) @channel.consumer.symfony
 `;
 
 // Ruby queries - works with tree-sitter-ruby
@@ -1280,6 +1523,27 @@ export const RUBY_QUERIES = `
     receiver: (_) @assignment.receiver
     method: (identifier) @assignment.property)
   right: (_)) @assignment
+
+; ── Message channel captures (ActiveSupport::Notifications) ────────────────
+
+; ActiveSupport instrument: instrument('event.namespace', ...)
+; Can be called as ActiveSupport::Notifications.instrument or just instrument
+(call
+  method: (identifier) @_as_instrument (#eq? @_as_instrument "instrument")
+  arguments: (argument_list
+    (string (string_content) @channel.name))) @channel.producer.ruby
+
+; ActiveSupport subscribe: subscribe('event.namespace', ...)
+(call
+  method: (identifier) @_as_subscribe (#eq? @_as_subscribe "subscribe")
+  arguments: (argument_list
+    (string (string_content) @channel.name))) @channel.consumer.ruby
+
+; ActiveSupport unsubscribe: unsubscribe('event.namespace')
+(call
+  method: (identifier) @_as_unsubscribe (#eq? @_as_unsubscribe "unsubscribe")
+  arguments: (argument_list
+    (string (string_content) @channel.name))) @channel.consumer.ruby
 `;
 
 // Kotlin queries - works with tree-sitter-kotlin (fwcd/tree-sitter-kotlin)
@@ -1436,6 +1700,59 @@ export const SWIFT_QUERIES = `
 ; Extensions wrap the name in user_type unlike class/struct/enum declarations
 (class_declaration "extension" name: (user_type (type_identifier) @heritage.class)
   (inheritance_specifier inherits_from: (user_type (type_identifier) @heritage.extends))) @heritage
+
+; ── Message channel captures (NotificationCenter) ──────────────────────────
+; tree-sitter-swift wraps argument labels in value_argument_label nodes.
+; Notification names appear as:
+;   .eventName → prefix_expression with simple_identifier
+;   Notification.Name(var) → call_expression wrapping the name variable
+;   Notification.Name.staticProp → navigation_expression
+
+; NotificationCenter.default.post(name: <notification>, ...)
+; Matches both .post(name: .myEvent) and .post(name: Notification.Name(var))
+(call_expression
+  (navigation_expression
+    (navigation_suffix (simple_identifier) @_swift_post (#eq? @_swift_post "post")))
+  (call_suffix (value_arguments
+    (value_argument
+      (value_argument_label
+        (simple_identifier) @_swift_name_label (#eq? @_swift_name_label "name"))
+      (_) @channel.name)))) @channel.producer.swift
+
+; NotificationCenter.default.addObserver(forName: <notification>, ...)
+; Closure-based API: addObserver(forName:object:queue:) { handler }
+(call_expression
+  (navigation_expression
+    (navigation_suffix (simple_identifier) @_swift_observe (#eq? @_swift_observe "addObserver")))
+  (call_suffix (value_arguments
+    (value_argument
+      (value_argument_label
+        (simple_identifier) @_swift_forname (#eq? @_swift_forname "forName"))
+      (_) @channel.name)))) @channel.consumer.swift
+
+; NotificationCenter.default.addObserver(_, selector:, name: <notification>, object:)
+; Selector-based API: name: is the 3rd argument
+(call_expression
+  (navigation_expression
+    (navigation_suffix (simple_identifier) @_swift_observe2 (#eq? @_swift_observe2 "addObserver")))
+  (call_suffix (value_arguments
+    (value_argument)
+    (value_argument)
+    (value_argument
+      (value_argument_label
+        (simple_identifier) @_swift_name_label2 (#eq? @_swift_name_label2 "name"))
+      (_) @channel.name)))) @channel.consumer.swift
+
+; NotificationCenter.default.removeObserver(_, name: <notification>, object:)
+(call_expression
+  (navigation_expression
+    (navigation_suffix (simple_identifier) @_swift_remove (#eq? @_swift_remove "removeObserver")))
+  (call_suffix (value_arguments
+    (value_argument)
+    (value_argument
+      (value_argument_label
+        (simple_identifier) @_swift_remove_name (#eq? @_swift_remove_name "name"))
+      (_) @channel.name)))) @channel.consumer.swift
 
 ; Write access: obj.field = value (tree-sitter-swift 0.7.1 uses named fields)
 (assignment

@@ -2327,13 +2327,16 @@ export class LocalBackend {
     } catch {
       return {
         markdown: '**No cross-repo channel registry found.** Run `gitnexus link` to build it.\n\n' +
-          'This command scans all indexed repos for message channels (Socket.IO, Electron IPC, EventEmitter, C# events) ' +
+          'This command scans all indexed repos for message channels (Socket.IO, Electron IPC, EventEmitter, C# events, ' +
+          'Python Socket.IO/Celery/Redis, Java Kafka/JMS/RabbitMQ, PHP WordPress hooks/Laravel/Symfony events, ' +
+          'Go NATS, Ruby ActiveSupport, Swift NotificationCenter) ' +
           'and matches producers to consumers across repo boundaries.',
       };
     }
 
     const channelFilter = params?.channel?.toLowerCase();
     const repoFilter = params?.repo?.toLowerCase();
+    const transportFilter = params?.transport?.toLowerCase();
 
     let channels = registry.channels || [];
 
@@ -2347,9 +2350,12 @@ export class LocalBackend {
         ch.consumers.some((c: any) => c.repo.toLowerCase().includes(repoFilter))
       );
     }
+    if (transportFilter) {
+      channels = channels.filter((ch: any) => ch.transport?.toLowerCase().includes(transportFilter));
+    }
 
     if (channels.length === 0) {
-      const filterDesc = [channelFilter && `channel="${channelFilter}"`, repoFilter && `repo="${repoFilter}"`].filter(Boolean).join(', ');
+      const filterDesc = [channelFilter && `channel="${channelFilter}"`, repoFilter && `repo="${repoFilter}"`, transportFilter && `transport="${transportFilter}"`].filter(Boolean).join(', ');
       return {
         markdown: `No cross-repo channels found${filterDesc ? ` matching ${filterDesc}` : ''}.\n\n` +
           `Registry has ${registry.crossRepoMatches ?? 0} cross-repo matches and ${registry.sameRepoMatches ?? 0} same-repo matches across ${registry.reposWithChannels ?? 0} repos.\n` +

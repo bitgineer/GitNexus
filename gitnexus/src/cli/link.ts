@@ -5,6 +5,16 @@
  * matches producers to consumers by channel name across repo boundaries,
  * and writes a cross-repo channel registry to ~/.gitnexus/cross-repo-channels.json.
  *
+ * Supported transports:
+ *   TS/JS: Electron IPC, Socket.IO, EventEmitter
+ *   C#:    Socket.IO wrapper, event delegates
+ *   Python: Socket.IO, Celery tasks, Redis pub/sub, EventEmitter (pyee)
+ *   Java:  Kafka, JMS, RabbitMQ (via Spring annotations)
+ *   PHP:   WordPress hooks, Laravel events, Symfony events
+ *   Go:    NATS pub/sub
+ *   Ruby:  ActiveSupport::Notifications
+ *   Swift: NotificationCenter
+ *
  * This captures ALL channels — both matched (producer+consumer in same repo)
  * and unmatched (producer-only or consumer-only) — enabling cross-service
  * message flow tracing.

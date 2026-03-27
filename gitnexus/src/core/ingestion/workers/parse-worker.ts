@@ -192,7 +192,15 @@ export interface ExtractedChannel {
   /** Whether this side sends or listens */
   role: 'producer' | 'consumer';
   /** Transport mechanism that matched */
-  transport: 'electron-ipc' | 'socket.io' | 'event-emitter' | 'csharp-event' | 'csharp-emitter';
+  transport:
+    | 'electron-ipc' | 'socket.io' | 'event-emitter'
+    | 'csharp-event' | 'csharp-emitter'
+    | 'python-socketio' | 'python-celery' | 'python-redis-pubsub' | 'python-event-emitter'
+    | 'java-kafka' | 'java-jms' | 'java-rabbitmq'
+    | 'php-wordpress-hook' | 'php-laravel-event' | 'php-symfony-event'
+    | 'ruby-activesupport'
+    | 'go-nats'
+    | 'swift-notification-center';
   /** ID of the enclosing function/method that contains this channel reference */
   enclosingSymbolId: string;
   /** Source line number */
@@ -1185,6 +1193,170 @@ const processFileGroup = (
       }
     }
 
+    // Python const collection: MODULE_LEVEL_VAR = 'value' → constValueMap
+    if (language === SupportedLanguages.Python) {
+      const root = tree.rootNode;
+      for (let i = 0; i < root.childCount; i++) {
+        const stmt = root.child(i);
+        // expression_statement → assignment with identifier LHS and string RHS
+        if (stmt?.type === 'expression_statement') {
+          const assign = stmt.namedChildren?.find((c: any) => c.type === 'assignment');
+          if (assign) {
+            const left = assign.childForFieldName?.('left');
+            const right = assign.childForFieldName?.('right');
+            if (left?.type === 'identifier' && right?.type === 'string') {
+              const content = right.namedChildren?.find((c: any) => c.type === 'string_content');
+              if (content) constValueMap.set(left.text, content.text);
+            }
+          }
+        }
+      }
+      if (constValueMap.size > 0) {
+        const consts: [string, string][] = [];
+        for (const [k, v] of constValueMap) consts.push([k, v]);
+        result.constValues.push({ filePath: file.path, consts, objectProps: [] });
+      }
+    }
+
+    // Java const collection: static final String FIELD = "value" → constValueMap
+    if (language === SupportedLanguages.Java) {
+      const walkJavaConsts = (node: any): void => {
+        if (!node) return;
+        if (node.type === 'field_declaration') {
+          // Check for static final modifiers
+          let isStatic = false, isFinal = false;
+          for (let i = 0; i < node.childCount; i++) {
+            const ch = node.child(i);
+            if (ch?.type === 'modifiers') {
+              const modText = ch.text;
+              if (modText.includes('static')) isStatic = true;
+              if (modText.includes('final')) isFinal = true;
+            }
+          }
+          if (isStatic && isFinal) {
+            const declarator = node.namedChildren?.find((c: any) => c.type === 'variable_declarator');
+            if (declarator) {
+              const nameNode = declarator.childForFieldName?.('name');
+              const valueNode = declarator.childForFieldName?.('value');
+              if (nameNode?.type === 'identifier' && valueNode?.type === 'string_literal') {
+                const raw = valueNode.text;
+                const val = raw.startsWith('"') && raw.endsWith('"') ? raw.slice(1, -1) : raw;
+                if (val) constValueMap.set(nameNode.text, val);
+              }
+            }
+          }
+        }
+        for (let i = 0; i < node.childCount; i++) walkJavaConsts(node.child(i));
+      };
+      walkJavaConsts(tree.rootNode);
+      if (constValueMap.size > 0) {
+        const consts: [string, string][] = [];
+        for (const [k, v] of constValueMap) consts.push([k, v]);
+        result.constValues.push({ filePath: file.path, consts, objectProps: [] });
+      }
+    }
+
+    // Go const collection: const Subject = "value" → constValueMap
+    if (language === SupportedLanguages.Go) {
+      const root = tree.rootNode;
+      for (let i = 0; i < root.childCount; i++) {
+        const node = root.child(i);
+        if (node?.type === 'const_declaration') {
+          for (let j = 0; j < node.namedChildCount; j++) {
+            const spec = node.namedChild(j);
+            if (spec?.type === 'const_spec') {
+              const nameNode = spec.childForFieldName?.('name');
+              const valueNode = spec.childForFieldName?.('value');
+              // Go may use expression_list for the value side
+              const valNode = valueNode?.type === 'expression_list'
+                ? valueNode.namedChildren?.[0]
+                : valueNode;
+              if (nameNode?.type === 'identifier' && valNode?.type === 'interpreted_string_literal') {
+                const raw = valNode.text;
+                const val = raw.startsWith('"') && raw.endsWith('"') ? raw.slice(1, -1) : raw;
+                if (val) constValueMap.set(nameNode.text, val);
+              }
+            }
+          }
+        }
+      }
+      if (constValueMap.size > 0) {
+        const consts: [string, string][] = [];
+        for (const [k, v] of constValueMap) consts.push([k, v]);
+        result.constValues.push({ filePath: file.path, consts, objectProps: [] });
+      }
+    }
+
+    // PHP const collection: const HOOK = 'value' and define('CONST', 'value') → constValueMap
+    if (language === SupportedLanguages.PHP) {
+      const walkPhpConsts = (node: any): void => {
+        if (!node) return;
+        // const HOOK = 'value';
+        if (node.type === 'const_declaration') {
+          for (let j = 0; j < node.namedChildCount; j++) {
+            const elem = node.namedChild(j);
+            if (elem?.type === 'const_element') {
+              const nameNode = elem.childForFieldName?.('name');
+              const valueNode = elem.childForFieldName?.('value');
+              if (nameNode && valueNode?.type === 'string') {
+                const content = valueNode.namedChildren?.find((c: any) => c.type === 'string_content');
+                if (content) constValueMap.set(nameNode.text, content.text);
+              }
+            }
+          }
+        }
+        // define('CONST_NAME', 'value')
+        if (node.type === 'function_call_expression') {
+          const funcName = node.childForFieldName?.('function');
+          if (funcName?.type === 'name' && funcName.text === 'define') {
+            const args = node.childForFieldName?.('arguments');
+            if (args) {
+              const argNodes = args.namedChildren?.filter((c: any) => c.type === 'argument') ?? [];
+              if (argNodes.length >= 2) {
+                const nameArg = argNodes[0].namedChildren?.find((c: any) => c.type === 'string');
+                const valArg = argNodes[1].namedChildren?.find((c: any) => c.type === 'string');
+                if (nameArg && valArg) {
+                  const nameContent = nameArg.namedChildren?.find((c: any) => c.type === 'string_content');
+                  const valContent = valArg.namedChildren?.find((c: any) => c.type === 'string_content');
+                  if (nameContent && valContent) constValueMap.set(nameContent.text, valContent.text);
+                }
+              }
+            }
+          }
+        }
+        for (let i = 0; i < node.childCount; i++) walkPhpConsts(node.child(i));
+      };
+      walkPhpConsts(tree.rootNode);
+      if (constValueMap.size > 0) {
+        const consts: [string, string][] = [];
+        for (const [k, v] of constValueMap) consts.push([k, v]);
+        result.constValues.push({ filePath: file.path, consts, objectProps: [] });
+      }
+    }
+
+    // Ruby const collection: CONSTANT = 'value' → constValueMap
+    if (language === SupportedLanguages.Ruby) {
+      const root = tree.rootNode;
+      const walkRubyConsts = (node: any): void => {
+        if (!node) return;
+        if (node.type === 'assignment') {
+          const left = node.childForFieldName?.('left');
+          const right = node.childForFieldName?.('right');
+          if (left?.type === 'constant' && right?.type === 'string') {
+            const content = right.namedChildren?.find((c: any) => c.type === 'string_content');
+            if (content) constValueMap.set(left.text, content.text);
+          }
+        }
+        for (let i = 0; i < node.childCount; i++) walkRubyConsts(node.child(i));
+      };
+      walkRubyConsts(root);
+      if (constValueMap.size > 0) {
+        const consts: [string, string][] = [];
+        for (const [k, v] of constValueMap) consts.push([k, v]);
+        result.constValues.push({ filePath: file.path, consts, objectProps: [] });
+      }
+    }
+
     // Build per-file type environment + constructor bindings in a single AST walk.
     // Constructor bindings are verified against the SymbolTable in processCallsFromExtracted.
     const parentMap: ReadonlyMap<string, readonly string[]> = fileParentMap;
@@ -1497,6 +1669,375 @@ const processFileGroup = (
           receiverText, handlerName,
           lineNumber: captureMap['event.subscribe'].startPosition.row,
         });
+        continue;
+      }
+
+      // ── Python channel captures (Socket.IO, EventEmitter, Celery, Redis) ──────
+
+      // Python Socket.IO / EventEmitter: obj.emit('event') or obj.on('event')
+      if ((captureMap['channel.producer.py'] || captureMap['channel.consumer.py']) && captureMap['channel.name']) {
+        const channelName = captureMap['channel.name'].text;
+        if (channelName !== 'connect' && channelName !== 'disconnect' && channelName !== 'error' && channelName !== 'connection') {
+          const isProducer = !!captureMap['channel.producer.py'];
+          const anchorNode = captureMap['channel.producer.py'] ?? captureMap['channel.consumer.py'];
+          const enclosingId = findEnclosingFunctionId(anchorNode, file.path, provider) ?? generateId('File', file.path);
+          const objName = (captureMap['channel.py.object']?.text ?? '').toLowerCase();
+          const transport = (objName.includes('socket') || objName.includes('sio') || objName === 'socketio')
+            ? 'python-socketio' as const : 'python-event-emitter' as const;
+          result.channels.push({
+            filePath: file.path, channelName, role: isProducer ? 'producer' : 'consumer',
+            transport, enclosingSymbolId: enclosingId,
+            lineNumber: anchorNode.startPosition.row,
+          });
+        }
+        continue;
+      }
+
+      // Python decorator listener: @socketio.on('event')
+      if (captureMap['channel.consumer.py.decorator'] && captureMap['channel.name']) {
+        const channelName = captureMap['channel.name'].text;
+        if (channelName !== 'connect' && channelName !== 'disconnect' && channelName !== 'error' && channelName !== 'connection') {
+          const enclosingId = findEnclosingFunctionId(captureMap['channel.consumer.py.decorator'], file.path, provider) ?? generateId('File', file.path);
+          const objName = (captureMap['channel.py.deco.object']?.text ?? '').toLowerCase();
+          const transport = (objName.includes('socket') || objName.includes('sio') || objName === 'socketio')
+            ? 'python-socketio' as const : 'python-event-emitter' as const;
+          result.channels.push({
+            filePath: file.path, channelName, role: 'consumer',
+            transport, enclosingSymbolId: enclosingId,
+            lineNumber: captureMap['channel.consumer.py.decorator'].startPosition.row,
+          });
+        }
+        continue;
+      }
+
+      // Python @sio.event / @socketio.event — event name = function name
+      if (captureMap['channel.consumer.py.event'] && captureMap['channel.name']) {
+        const channelName = captureMap['channel.name'].text;
+        if (channelName !== 'connect' && channelName !== 'disconnect' && channelName !== 'error' && channelName !== 'connection') {
+          const enclosingId = findEnclosingFunctionId(captureMap['channel.consumer.py.event'], file.path, provider) ?? generateId('File', file.path);
+          const objName = (captureMap['channel.py.event.object']?.text ?? '').toLowerCase();
+          const transport = (objName.includes('socket') || objName.includes('sio') || objName === 'socketio')
+            ? 'python-socketio' as const : 'python-event-emitter' as const;
+          result.channels.push({
+            filePath: file.path, channelName, role: 'consumer',
+            transport, enclosingSymbolId: enclosingId,
+            lineNumber: captureMap['channel.consumer.py.event'].startPosition.row,
+          });
+        }
+        continue;
+      }
+
+      // Python Socket.IO / EventEmitter with variable: obj.emit(VARIABLE)
+      if ((captureMap['channel.producer.py.var'] || captureMap['channel.consumer.py.var']) && captureMap['channel.name.var']) {
+        const varName = captureMap['channel.name.var'].text;
+        const channelName = constValueMap.get(varName);
+        if (channelName && channelName !== 'connect' && channelName !== 'disconnect' && channelName !== 'error') {
+          const isProducer = !!captureMap['channel.producer.py.var'];
+          const anchorNode = captureMap['channel.producer.py.var'] ?? captureMap['channel.consumer.py.var'];
+          const enclosingId = findEnclosingFunctionId(anchorNode, file.path, provider) ?? generateId('File', file.path);
+          const objName = (captureMap['channel.py.var.object']?.text ?? '').toLowerCase();
+          const transport = (objName.includes('socket') || objName.includes('sio') || objName === 'socketio')
+            ? 'python-socketio' as const : 'python-event-emitter' as const;
+          result.channels.push({
+            filePath: file.path, channelName, role: isProducer ? 'producer' : 'consumer',
+            transport, enclosingSymbolId: enclosingId,
+            lineNumber: anchorNode.startPosition.row,
+          });
+        }
+        continue;
+      }
+
+      // Celery send_task producer: app.send_task('task.name')
+      if (captureMap['channel.producer.celery'] && captureMap['channel.name']) {
+        const channelName = captureMap['channel.name'].text;
+        const enclosingId = findEnclosingFunctionId(captureMap['channel.producer.celery'], file.path, provider) ?? generateId('File', file.path);
+        result.channels.push({
+          filePath: file.path, channelName, role: 'producer',
+          transport: 'python-celery', enclosingSymbolId: enclosingId,
+          lineNumber: captureMap['channel.producer.celery'].startPosition.row,
+        });
+        continue;
+      }
+
+      // Celery task decorator consumer: @app.task(name='task.name'), @shared_task(name='task.name')
+      if (captureMap['channel.consumer.celery'] && captureMap['channel.name']) {
+        const channelName = captureMap['channel.name'].text;
+        const enclosingId = findEnclosingFunctionId(captureMap['channel.consumer.celery'], file.path, provider) ?? generateId('File', file.path);
+        result.channels.push({
+          filePath: file.path, channelName, role: 'consumer',
+          transport: 'python-celery', enclosingSymbolId: enclosingId,
+          lineNumber: captureMap['channel.consumer.celery'].startPosition.row,
+        });
+        continue;
+      }
+
+      // Redis publish/subscribe
+      if ((captureMap['channel.producer.redis'] || captureMap['channel.consumer.redis']) && captureMap['channel.name']) {
+        const channelName = captureMap['channel.name'].text;
+        const isProducer = !!captureMap['channel.producer.redis'];
+        const anchorNode = captureMap['channel.producer.redis'] ?? captureMap['channel.consumer.redis'];
+        const enclosingId = findEnclosingFunctionId(anchorNode, file.path, provider) ?? generateId('File', file.path);
+        result.channels.push({
+          filePath: file.path, channelName, role: isProducer ? 'producer' : 'consumer',
+          transport: 'python-redis-pubsub', enclosingSymbolId: enclosingId,
+          lineNumber: anchorNode.startPosition.row,
+        });
+        continue;
+      }
+
+      // ── Java channel captures (Kafka, JMS, RabbitMQ) ──────────────────────
+
+      // Java method call with string first arg: template.send("topic", msg)
+      if (captureMap['channel.java'] && captureMap['channel.name'] && captureMap['channel.java.method']) {
+        const methodName = captureMap['channel.java.method'].text;
+        if (methodName === 'send' || methodName === 'convertAndSend' || methodName === 'sendDefault') {
+          const rawName = captureMap['channel.name'].text;
+          const channelName = rawName.startsWith('"') && rawName.endsWith('"') ? rawName.slice(1, -1) : rawName;
+          if (channelName) {
+            const enclosingId = findEnclosingFunctionId(captureMap['channel.java'], file.path, provider) ?? generateId('File', file.path);
+            const objName = (captureMap['channel.java.object']?.text ?? '').toLowerCase();
+            let transport: 'java-kafka' | 'java-jms' | 'java-rabbitmq' = 'java-kafka';
+            if (objName.includes('jms')) transport = 'java-jms';
+            else if (objName.includes('rabbit')) transport = 'java-rabbitmq';
+            result.channels.push({
+              filePath: file.path, channelName, role: 'producer',
+              transport, enclosingSymbolId: enclosingId,
+              lineNumber: captureMap['channel.java'].startPosition.row,
+            });
+          }
+        }
+        continue;
+      }
+
+      // Java annotation consumer: @KafkaListener(topics = "topic"), @JmsListener(destination = "dest"), @RabbitListener(queues = "queue")
+      if ((captureMap['channel.java.annotation'] || captureMap['channel.java.annotation.array']) && captureMap['channel.name'] && captureMap['channel.java.annotation.name']) {
+        const annotName = captureMap['channel.java.annotation.name'].text;
+        const attrKey = captureMap['channel.java.annotation.key']?.text ?? '';
+        // Validate annotation + attribute combination
+        const validAnnotation =
+          (annotName === 'KafkaListener' && (attrKey === 'topics' || attrKey === 'value')) ||
+          (annotName === 'JmsListener' && (attrKey === 'destination' || attrKey === 'value')) ||
+          (annotName === 'RabbitListener' && (attrKey === 'queues' || attrKey === 'value'));
+        if (validAnnotation) {
+          const rawName = captureMap['channel.name'].text;
+          const channelName = rawName.startsWith('"') && rawName.endsWith('"') ? rawName.slice(1, -1) : rawName;
+          if (channelName) {
+            const anchorNode = captureMap['channel.java.annotation'] ?? captureMap['channel.java.annotation.array'];
+            const enclosingId = findEnclosingFunctionId(anchorNode, file.path, provider) ?? generateId('File', file.path);
+            let transport: 'java-kafka' | 'java-jms' | 'java-rabbitmq' = 'java-kafka';
+            if (annotName === 'JmsListener') transport = 'java-jms';
+            else if (annotName === 'RabbitListener') transport = 'java-rabbitmq';
+            result.channels.push({
+              filePath: file.path, channelName, role: 'consumer',
+              transport, enclosingSymbolId: enclosingId,
+              lineNumber: anchorNode.startPosition.row,
+            });
+          }
+        }
+        continue;
+      }
+
+      // Java method call with const variable: template.send(TOPIC_CONST, msg)
+      if (captureMap['channel.java.var'] && captureMap['channel.name.var'] && captureMap['channel.java.var.method']) {
+        const methodName = captureMap['channel.java.var.method'].text;
+        if (methodName === 'send' || methodName === 'convertAndSend' || methodName === 'sendDefault') {
+          const varName = captureMap['channel.name.var'].text;
+          const channelName = constValueMap.get(varName);
+          if (channelName) {
+            const enclosingId = findEnclosingFunctionId(captureMap['channel.java.var'], file.path, provider) ?? generateId('File', file.path);
+            const objName = (captureMap['channel.java.var.object']?.text ?? '').toLowerCase();
+            let transport: 'java-kafka' | 'java-jms' | 'java-rabbitmq' = 'java-kafka';
+            if (objName.includes('jms')) transport = 'java-jms';
+            else if (objName.includes('rabbit')) transport = 'java-rabbitmq';
+            result.channels.push({
+              filePath: file.path, channelName, role: 'producer',
+              transport, enclosingSymbolId: enclosingId,
+              lineNumber: captureMap['channel.java.var'].startPosition.row,
+            });
+          }
+        }
+        continue;
+      }
+
+      // ── PHP channel captures (WordPress, Laravel, Symfony) ──────────────────
+
+      // WordPress do_action / apply_filters (producers)
+      if ((captureMap['channel.producer.wp'] || captureMap['channel.producer.wp.filter']) && captureMap['channel.name']) {
+        const channelName = captureMap['channel.name'].text;
+        const anchorNode = captureMap['channel.producer.wp'] ?? captureMap['channel.producer.wp.filter'];
+        const enclosingId = findEnclosingFunctionId(anchorNode, file.path, provider) ?? generateId('File', file.path);
+        result.channels.push({
+          filePath: file.path, channelName, role: 'producer',
+          transport: 'php-wordpress-hook', enclosingSymbolId: enclosingId,
+          lineNumber: anchorNode.startPosition.row,
+        });
+        continue;
+      }
+
+      // WordPress add_action / add_filter / has_action / has_filter / remove_action / remove_filter (consumers)
+      if ((captureMap['channel.consumer.wp'] || captureMap['channel.consumer.wp.filter'] || captureMap['channel.consumer.wp.ref']) && captureMap['channel.name']) {
+        const channelName = captureMap['channel.name'].text;
+        const anchorNode = captureMap['channel.consumer.wp'] ?? captureMap['channel.consumer.wp.filter'] ?? captureMap['channel.consumer.wp.ref'];
+        const enclosingId = findEnclosingFunctionId(anchorNode, file.path, provider) ?? generateId('File', file.path);
+        result.channels.push({
+          filePath: file.path, channelName, role: 'consumer',
+          transport: 'php-wordpress-hook', enclosingSymbolId: enclosingId,
+          lineNumber: anchorNode.startPosition.row,
+        });
+        continue;
+      }
+
+      // Laravel event() dispatch (producer) and Event::listen/dispatch (producer/consumer)
+      if (captureMap['channel.producer.laravel'] && captureMap['channel.name']) {
+        const channelName = captureMap['channel.name'].text;
+        const enclosingId = findEnclosingFunctionId(captureMap['channel.producer.laravel'], file.path, provider) ?? generateId('File', file.path);
+        result.channels.push({
+          filePath: file.path, channelName, role: 'producer',
+          transport: 'php-laravel-event', enclosingSymbolId: enclosingId,
+          lineNumber: captureMap['channel.producer.laravel'].startPosition.row,
+        });
+        continue;
+      }
+
+      if (captureMap['channel.consumer.laravel'] && captureMap['channel.name']) {
+        const channelName = captureMap['channel.name'].text;
+        const enclosingId = findEnclosingFunctionId(captureMap['channel.consumer.laravel'], file.path, provider) ?? generateId('File', file.path);
+        result.channels.push({
+          filePath: file.path, channelName, role: 'consumer',
+          transport: 'php-laravel-event', enclosingSymbolId: enclosingId,
+          lineNumber: captureMap['channel.consumer.laravel'].startPosition.row,
+        });
+        continue;
+      }
+
+      // Symfony dispatch (producer) / addListener / removeListener (consumer)
+      if (captureMap['channel.producer.symfony'] && captureMap['channel.name']) {
+        const channelName = captureMap['channel.name'].text;
+        const enclosingId = findEnclosingFunctionId(captureMap['channel.producer.symfony'], file.path, provider) ?? generateId('File', file.path);
+        result.channels.push({
+          filePath: file.path, channelName, role: 'producer',
+          transport: 'php-symfony-event', enclosingSymbolId: enclosingId,
+          lineNumber: captureMap['channel.producer.symfony'].startPosition.row,
+        });
+        continue;
+      }
+
+      if (captureMap['channel.consumer.symfony'] && captureMap['channel.name']) {
+        const channelName = captureMap['channel.name'].text;
+        const enclosingId = findEnclosingFunctionId(captureMap['channel.consumer.symfony'], file.path, provider) ?? generateId('File', file.path);
+        result.channels.push({
+          filePath: file.path, channelName, role: 'consumer',
+          transport: 'php-symfony-event', enclosingSymbolId: enclosingId,
+          lineNumber: captureMap['channel.consumer.symfony'].startPosition.row,
+        });
+        continue;
+      }
+
+      // ── Go channel captures (NATS pub/sub) ────────────────────────────────
+
+      // Go NATS Publish/Subscribe with string literal
+      if ((captureMap['channel.producer.go'] || captureMap['channel.consumer.go']) && captureMap['channel.name']) {
+        const rawName = captureMap['channel.name'].text;
+        // Go string literals include quotes: "subject" → subject
+        const channelName = rawName.startsWith('"') && rawName.endsWith('"') ? rawName.slice(1, -1) : rawName;
+        if (channelName) {
+          const isProducer = !!captureMap['channel.producer.go'];
+          const anchorNode = captureMap['channel.producer.go'] ?? captureMap['channel.consumer.go'];
+          const enclosingId = findEnclosingFunctionId(anchorNode, file.path, provider) ?? generateId('File', file.path);
+          result.channels.push({
+            filePath: file.path, channelName, role: isProducer ? 'producer' : 'consumer',
+            transport: 'go-nats', enclosingSymbolId: enclosingId,
+            lineNumber: anchorNode.startPosition.row,
+          });
+        }
+        continue;
+      }
+
+      // Go NATS with const variable
+      if ((captureMap['channel.producer.go.var'] || captureMap['channel.consumer.go.var']) && captureMap['channel.name.var']) {
+        const varName = captureMap['channel.name.var'].text;
+        const channelName = constValueMap.get(varName);
+        if (channelName) {
+          const isProducer = !!captureMap['channel.producer.go.var'];
+          const anchorNode = captureMap['channel.producer.go.var'] ?? captureMap['channel.consumer.go.var'];
+          const enclosingId = findEnclosingFunctionId(anchorNode, file.path, provider) ?? generateId('File', file.path);
+          result.channels.push({
+            filePath: file.path, channelName, role: isProducer ? 'producer' : 'consumer',
+            transport: 'go-nats', enclosingSymbolId: enclosingId,
+            lineNumber: anchorNode.startPosition.row,
+          });
+        }
+        continue;
+      }
+
+      // ── Ruby channel captures (ActiveSupport::Notifications) ──────────────
+
+      if ((captureMap['channel.producer.ruby'] || captureMap['channel.consumer.ruby']) && captureMap['channel.name']) {
+        const channelName = captureMap['channel.name'].text;
+        const isProducer = !!captureMap['channel.producer.ruby'];
+        const anchorNode = captureMap['channel.producer.ruby'] ?? captureMap['channel.consumer.ruby'];
+        const enclosingId = findEnclosingFunctionId(anchorNode, file.path, provider) ?? generateId('File', file.path);
+        result.channels.push({
+          filePath: file.path, channelName, role: isProducer ? 'producer' : 'consumer',
+          transport: 'ruby-activesupport', enclosingSymbolId: enclosingId,
+          lineNumber: anchorNode.startPosition.row,
+        });
+        continue;
+      }
+
+      // ── Swift channel captures (NotificationCenter) ────────────────────────
+
+      if ((captureMap['channel.producer.swift'] || captureMap['channel.consumer.swift']) && captureMap['channel.name']) {
+        const nameNode = captureMap['channel.name'];
+        let channelName: string | undefined;
+
+        if (nameNode.type === 'prefix_expression') {
+          // .eventName → prefix_expression with "." + simple_identifier
+          // Extract the simple_identifier child
+          const idChild = nameNode.namedChildren?.find((c: any) => c.type === 'simple_identifier');
+          channelName = idChild?.text;
+        } else if (nameNode.type === 'call_expression') {
+          // Notification.Name(variableOrString) → extract the argument
+          const suffix = nameNode.namedChildren?.find((c: any) => c.type === 'call_suffix');
+          const args = suffix?.namedChildren?.find((c: any) => c.type === 'value_arguments');
+          const firstArg = args?.namedChildren?.find((c: any) => c.type === 'value_argument');
+          if (firstArg) {
+            // Could be a string literal or a variable identifier
+            const strNode = firstArg.namedChildren?.find((c: any) => c.type === 'line_string_literal');
+            if (strNode) {
+              // String literal: Notification.Name("myEvent")
+              const content = strNode.namedChildren?.find((c: any) => c.type === 'line_str_text');
+              channelName = content?.text ?? strNode.text?.replace(/"/g, '');
+            } else {
+              // Variable: Notification.Name(varName) → try const resolution
+              const idNode = firstArg.namedChildren?.find((c: any) => c.type === 'simple_identifier');
+              if (idNode) {
+                channelName = constValueMap.get(idNode.text) ?? idNode.text;
+              }
+            }
+          }
+        } else if (nameNode.type === 'navigation_expression') {
+          // Notification.Name.staticProp or NSNotification.Name.x
+          const rawName = nameNode.text;
+          channelName = rawName;
+          if (channelName.startsWith('Notification.Name.')) channelName = channelName.substring('Notification.Name.'.length);
+          if (channelName.startsWith('NSNotification.Name.')) channelName = channelName.substring('NSNotification.Name.'.length);
+        } else {
+          // Fallback: use raw text
+          channelName = nameNode.text;
+          if (channelName.startsWith('.')) channelName = channelName.substring(1);
+        }
+
+        if (channelName) {
+          const isProducer = !!captureMap['channel.producer.swift'];
+          const anchorNode = captureMap['channel.producer.swift'] ?? captureMap['channel.consumer.swift'];
+          const enclosingId = findEnclosingFunctionId(anchorNode, file.path, provider) ?? generateId('File', file.path);
+          result.channels.push({
+            filePath: file.path, channelName, role: isProducer ? 'producer' : 'consumer',
+            transport: 'swift-notification-center', enclosingSymbolId: enclosingId,
+            lineNumber: anchorNode.startPosition.row,
+          });
+        }
         continue;
       }
 
