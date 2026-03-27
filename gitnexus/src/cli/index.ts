@@ -119,6 +119,13 @@ program
   .option('-r, --repo <name>', 'Target repository')
   .action(createLazyAction(() => import('./tool.js'), 'cypherCommand'));
 
+// ─── Cross-Repo Linking ─────────────────────────────────────────────
+
+program
+  .command('link')
+  .description('Build cross-repo channel index — matches message producers to consumers across repositories')
+  .action(createLazyAction(() => import('./link.js'), 'linkCommand'));
+
 // ─── Eval Server (persistent daemon for SWE-bench) ─────────────────
 
 program

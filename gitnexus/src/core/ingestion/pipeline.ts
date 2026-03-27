@@ -1481,7 +1481,7 @@ export const runPipelineFromRepo = async (
       },
     });
 
-    return { graph, repoPath, totalFileCount: totalFiles, communityResult, processResult };
+    return { graph, repoPath, totalFileCount: totalFiles, communityResult, processResult, allChannels };
   } catch (error) {
     ctx.clear();
     throw error;

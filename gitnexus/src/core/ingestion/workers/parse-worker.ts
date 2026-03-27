@@ -1138,6 +1138,53 @@ const processFileGroup = (
       }
     }
 
+    // C# const field collection: private const string FIELD = "value" → constValueMap
+    if (language === SupportedLanguages.CSharp) {
+      const walkForConsts = (node: any): void => {
+        if (!node) return;
+        if (node.type === 'field_declaration') {
+          let isConst = false;
+          for (let i = 0; i < node.childCount; i++) {
+            const ch = node.child(i);
+            if (ch?.type === 'modifier' && ch.text === 'const') { isConst = true; break; }
+            if (ch?.isNamed && ch.type !== 'modifier') break;
+          }
+          if (isConst) {
+            const varDecl = node.namedChildren?.find((c: any) => c.type === 'variable_declaration');
+            if (varDecl) {
+              for (let j = 0; j < varDecl.namedChildCount; j++) {
+                const declarator = varDecl.namedChild(j);
+                if (declarator?.type === 'variable_declarator') {
+                  const nameNode = declarator.namedChildren?.find((c: any) => c.type === 'identifier');
+                  const literalNode = declarator.namedChildren?.find((c: any) => c.type === 'string_literal');
+                  if (nameNode && literalNode) {
+                    const contentNode = literalNode.namedChildren?.find((c: any) =>
+                      c.type === 'string_literal_content' || c.type === 'string_fragment');
+                    if (contentNode) {
+                      constValueMap.set(nameNode.text, contentNode.text);
+                    } else {
+                      const raw = literalNode.text;
+                      const val = raw.startsWith('"') && raw.endsWith('"') ? raw.slice(1, -1) : raw;
+                      if (val) constValueMap.set(nameNode.text, val);
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        for (let i = 0; i < node.childCount; i++) walkForConsts(node.child(i));
+      };
+      walkForConsts(tree.rootNode);
+
+      // Serialize for cross-file resolution
+      if (constValueMap.size > 0) {
+        const consts: [string, string][] = [];
+        for (const [k, v] of constValueMap) consts.push([k, v]);
+        result.constValues.push({ filePath: file.path, consts, objectProps: [] });
+      }
+    }
+
     // Build per-file type environment + constructor bindings in a single AST walk.
     // Constructor bindings are verified against the SymbolTable in processCallsFromExtracted.
     const parentMap: ReadonlyMap<string, readonly string[]> = fileParentMap;
@@ -1410,14 +1457,14 @@ const processFileGroup = (
       if (captureMap['channel.csharp.var'] && captureMap['channel.name.var'] && captureMap['channel.method']) {
         const methodName = captureMap['channel.method'].text;
         const varName = captureMap['channel.name.var'].text;
-        // For C#, consts are fields — check if varName is UPPER_CASE (convention for consts)
         if (methodName === 'On' || methodName === 'OnRequest' || methodName === 'OnResponse'
             || methodName === 'Emit' || methodName === 'EmitRequest' || methodName === 'EmitFailure') {
           const role = methodName.startsWith('On') ? 'consumer' as const : 'producer' as const;
           const enclosingId = findEnclosingFunctionId(captureMap['channel.csharp.var'], file.path, provider) ?? generateId('File', file.path);
-          // Store using the variable name as channel name — will be resolved by cross-file const map if available
+          // Resolve const field to string value if available
+          const channelName = constValueMap.get(varName) ?? varName;
           result.channels.push({
-            filePath: file.path, channelName: varName, role,
+            filePath: file.path, channelName, role,
             transport: 'csharp-emitter', enclosingSymbolId: enclosingId,
             lineNumber: captureMap['channel.csharp.var'].startPosition.row,
           });

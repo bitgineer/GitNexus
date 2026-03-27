@@ -309,6 +309,24 @@ export const TYPESCRIPT_QUERIES = `
     (member_expression
       object: (identifier) @channel.ref.obj
       property: (property_identifier) @channel.ref.prop))) @channel.producer.socket.member
+
+; Chained .on(CONST_VAR, handler) — socket.on(...).on(CONST, handler)
+(call_expression
+  function: (member_expression
+    object: (call_expression)
+    property: (property_identifier) @_on_chain_var (#match? @_on_chain_var "^(on|once|off)$"))
+  arguments: (arguments
+    .
+    (identifier) @channel.name.var)) @channel.consumer.socket.var
+
+; Chained .emit(CONST_VAR, data)
+(call_expression
+  function: (member_expression
+    object: (call_expression)
+    property: (property_identifier) @_emit_chain_var (#match? @_emit_chain_var "^emit$"))
+  arguments: (arguments
+    .
+    (identifier) @channel.name.var)) @channel.producer.socket.var
 `;
 
 // Extra JSX-specific queries — appended for .tsx/.jsx files (TSX grammar only)
@@ -581,6 +599,24 @@ export const JAVASCRIPT_QUERIES = `
     (member_expression
       object: (identifier) @channel.ref.obj
       property: (property_identifier) @channel.ref.prop))) @channel.producer.socket.member
+
+; Chained .on(CONST_VAR, handler) — socket.on(...).on(CONST, handler)
+(call_expression
+  function: (member_expression
+    object: (call_expression)
+    property: (property_identifier) @_on_chain_var_js (#match? @_on_chain_var_js "^(on|once|off)$"))
+  arguments: (arguments
+    .
+    (identifier) @channel.name.var)) @channel.consumer.socket.var
+
+; Chained .emit(CONST_VAR, data)
+(call_expression
+  function: (member_expression
+    object: (call_expression)
+    property: (property_identifier) @_emit_chain_var_js (#match? @_emit_chain_var_js "^emit$"))
+  arguments: (arguments
+    .
+    (identifier) @channel.name.var)) @channel.producer.socket.var
 `;
 
 // Python queries - works with tree-sitter-python
@@ -977,6 +1013,23 @@ export const CSHARP_QUERIES = `
   function: (member_access_expression
     expression: (_) @channel.object
     name: (identifier) @channel.method)
+  arguments: (argument_list
+    .
+    (argument (identifier) @channel.name.var))) @channel.csharp.var
+
+; C# generic method call with string first arg: _socket.On<T>("event", handler)
+(invocation_expression
+  function: (member_access_expression
+    expression: (_) @channel.object
+    name: (generic_name (identifier) @channel.method))
+  arguments: (argument_list
+    (argument (string_literal) @channel.name))) @channel.csharp
+
+; C# generic method call with const first arg: _socket.On<T>(CONST, handler)
+(invocation_expression
+  function: (member_access_expression
+    expression: (_) @channel.object
+    name: (generic_name (identifier) @channel.method))
   arguments: (argument_list
     .
     (argument (identifier) @channel.name.var))) @channel.csharp.var
