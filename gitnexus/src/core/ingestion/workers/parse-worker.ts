@@ -51,6 +51,16 @@ import {
 import { buildTypeEnv } from '../type-env.js';
 import type { ConstructorBinding } from '../type-env.js';
 import { detectFrameworkFromAST } from '../framework-detection.js';
+import { JSX_EXTRA_QUERIES } from '../tree-sitter-queries.js';
+
+/** Channel names to skip — lifecycle events and process signals, not real message channels */
+const SKIP_CHANNEL_NAMES = new Set([
+  'connect', 'disconnect', 'error', 'connection', 'close', 'open', 'listening',
+  'SIGINT', 'SIGTERM', 'SIGKILL', 'SIGHUP', 'SIGBREAK', 'SIGUSR1', 'SIGUSR2',
+  'exit', 'beforeExit', 'warning', 'message', 'rejectionHandled',
+  'uncaughtException', 'uncaughtExceptionMonitor', 'unhandledRejection',
+  'multipleResolves', 'worker',
+]);
 import { generateId } from '../../../lib/utils.js';
 import { preprocessImportPath } from '../import-processor.js';
 import type { NamedBinding } from '../named-bindings/types.js';
@@ -140,6 +150,8 @@ export interface ExtractedCall {
    * Length is capped at MAX_CHAIN_DEPTH (3).
    */
   receiverMixedChain?: MixedChainStep[];
+  /** Whether this call is inside an await expression */
+  isAwaited?: boolean;
 }
 
 export interface ExtractedAssignment {
@@ -194,6 +206,82 @@ export interface ExtractedToolDef {
   lineNumber: number;
 }
 
+export interface ExtractedChannel {
+  /** File containing this channel reference */
+  filePath: string;
+  /** The string-literal channel/event name (e.g., 'user-created', 'data-sync') */
+  channelName: string;
+  /** Whether this side sends or listens */
+  role: 'producer' | 'consumer';
+  /** Transport mechanism that matched */
+  transport:
+    | 'electron-ipc' | 'socket.io' | 'event-emitter'
+    | 'csharp-event' | 'csharp-emitter'
+    | 'python-socketio' | 'python-celery' | 'python-redis-pubsub' | 'python-event-emitter'
+    | 'java-kafka' | 'java-jms' | 'java-rabbitmq'
+    | 'php-wordpress-hook' | 'php-laravel-event' | 'php-symfony-event'
+    | 'ruby-activesupport'
+    | 'go-nats'
+    | 'swift-notification-center';
+  /** ID of the enclosing function/method that contains this channel reference */
+  enclosingSymbolId: string;
+  /** Source line number */
+  lineNumber: number;
+}
+
+export interface ExtractedEventRef {
+  filePath: string;
+  /** The event field name (e.g., 'OnConnected', 'TimerTick') */
+  eventName: string;
+  /** Whether this is a fire (?.Invoke) or subscribe (+=) site */
+  role: 'fire' | 'subscribe';
+  /** ID of the enclosing function/method */
+  enclosingSymbolId: string;
+  /** The receiver text for scoping (e.g., '_socket', 'f') — only for subscribe sites */
+  receiverText?: string;
+  /** The handler name (for subscribe sites: the function assigned via +=) */
+  handlerName?: string;
+  lineNumber: number;
+}
+
+export interface ExtractedOverride {
+  filePath: string;
+  /** Name of the method with override modifier */
+  methodName: string;
+  /** Node ID of the override method */
+  methodNodeId: string;
+  /** Node ID of the enclosing class */
+  enclosingClassId: string;
+}
+
+export interface ExtractedExtensionMethod {
+  filePath: string;
+  methodName: string;
+  methodNodeId: string;
+  /** The type being extended (e.g., 'IRepository', 'Vector3') */
+  extendedTypeName: string;
+}
+
+export interface ExtractedContextRef {
+  filePath: string;
+  /** The context variable name (e.g., 'ThemeContext', 'AuthContext') */
+  contextName: string;
+  /** Whether this is a provider (<Ctx.Provider>) or consumer (useContext(Ctx)) */
+  role: 'provider' | 'consumer';
+  /** ID of the enclosing function/component */
+  enclosingSymbolId: string;
+  lineNumber: number;
+}
+
+/** Per-file const value map: varName → string literal value, for same-file const resolution */
+export interface FileConstValues {
+  filePath: string;
+  /** [constName, stringValue] pairs — e.g., ['EVENT_USER_LOGIN', 'UserLogin'] */
+  consts: [string, string][];
+  /** [objectName, [propName, stringValue][]] — e.g., ['Events', [['USER_JOINED', 'user-joined']]] */
+  objectProps: [string, [string, string][]][];
+}
+
 export interface ExtractedORMQuery {
   filePath: string;
   orm: 'prisma' | 'supabase';
@@ -227,6 +315,12 @@ export interface ParseWorkerResult {
   fetchCalls: ExtractedFetchCall[];
   decoratorRoutes: ExtractedDecoratorRoute[];
   toolDefs: ExtractedToolDef[];
+  channels: ExtractedChannel[];
+  eventRefs: ExtractedEventRef[];
+  overrides: ExtractedOverride[];
+  extensionMethods: ExtractedExtensionMethod[];
+  contextRefs: ExtractedContextRef[];
+  constValues: FileConstValues[];
   ormQueries: ExtractedORMQuery[];
   constructorBindings: FileConstructorBindings[];
   /** File-scope type bindings from TypeEnv fixpoint for exported symbol collection. */
@@ -297,14 +391,58 @@ const classIdCache = new Map<any, string | null>();
 const functionIdCache = new Map<any, string | null>();
 const exportCache = new Map<any, boolean>();
 
-const clearCaches = (): void => { classIdCache.clear(); functionIdCache.clear(); exportCache.clear(); fieldInfoCache.clear(); };
+// ============================================================================
+// Enclosing namespace detection (for C# partial class unification)
+// ============================================================================
 
+const namespaceCache = new Map<any, string | null>();
+
+/** Walk up AST (or check siblings) to find the enclosing C# namespace.
+ *  Handles both block-scoped (`namespace N { class C {} }`) and
+ *  file-scoped (`namespace N; class C {}`) declarations. */
+const findEnclosingNamespace = (node: any): string | null => {
+  const cached = namespaceCache.get(node);
+  if (cached !== undefined) return cached;
+
+  let current = node.parent;
+  while (current) {
+    // Block-scoped: class is inside namespace_declaration > declaration_list
+    if (current.type === 'namespace_declaration') {
+      const nameNode = current.childForFieldName?.('name')
+        ?? current.children?.find((c: any) => c.type === 'qualified_name' || c.type === 'identifier');
+      const ns = nameNode?.text ?? null;
+      namespaceCache.set(node, ns);
+      return ns;
+    }
+    current = current.parent;
+  }
+
+  // File-scoped: file_scoped_namespace_declaration is a sibling at compilation_unit level
+  const root = node.tree?.rootNode;
+  if (root) {
+    for (let i = 0; i < root.childCount; i++) {
+      const child = root.child(i);
+      if (child?.type === 'file_scoped_namespace_declaration') {
+        const nameNode = child.childForFieldName?.('name')
+          ?? child.children?.find((c: any) => c.type === 'qualified_name' || c.type === 'identifier');
+        const ns = nameNode?.text ?? null;
+        namespaceCache.set(node, ns);
+        return ns;
+      }
+    }
+  }
+
+  namespaceCache.set(node, null);
+  return null;
+};
 // ============================================================================
 // FieldExtractor cache — extract field metadata once per class, reuse for each property.
 // Keyed by class node startIndex (unique per AST node within a file).
 // ============================================================================
 
 const fieldInfoCache = new Map<number, Map<string, FieldInfo>>();
+
+const clearCaches = (): void => { classIdCache.clear(); functionIdCache.clear(); exportCache.clear(); namespaceCache.clear(); fieldInfoCache.clear(); };
 
 /**
  * Walk up from a definition node to find the nearest enclosing class/struct/interface
@@ -453,6 +591,12 @@ const processBatch = (files: ParseWorkerInput[], onProgress?: (filesProcessed: n
     fetchCalls: [],
     decoratorRoutes: [],
     toolDefs: [],
+    channels: [],
+    eventRefs: [],
+    overrides: [],
+    extensionMethods: [],
+    contextRefs: [],
+    constValues: [],
     ormQueries: [],
     constructorBindings: [],
     typeEnvBindings: [],
@@ -520,12 +664,13 @@ const processBatch = (files: ParseWorkerInput[], onProgress?: (filesProcessed: n
       }
     }
 
-    // Process tsx files separately (different grammar)
+    // Process tsx files separately (different grammar, with JSX-specific queries)
     if (tsxFiles.length > 0) {
       if (isLanguageAvailable(language, tsxFiles[0].path)) {
         try {
           setLanguage(language, tsxFiles[0].path);
-          processFileGroup(tsxFiles, language, queryString, result, onFileProcessed);
+          const tsxQueryString = queryString + '\n' + (JSX_EXTRA_QUERIES || '');
+          processFileGroup(tsxFiles, language, tsxQueryString, result, onFileProcessed);
         } catch {
           // parser unavailable — skip this language group
         }
@@ -533,6 +678,41 @@ const processBatch = (files: ParseWorkerInput[], onProgress?: (filesProcessed: n
         result.skippedLanguages[language] = (result.skippedLanguages[language] || 0) + tsxFiles.length;
       }
     }
+  }
+
+  // ── SCSS/CSS class name extraction (regex-based, no tree-sitter) ──────────
+  // Extract CSS class names from .scss/.css files as CodeElement nodes.
+  const SCSS_CLASS_RE = /^\s*[.&]([a-zA-Z_][\w-]*)\s*[,{&:\s]/gm;
+  const SCSS_SKIP_RE = /^\s*[@$%\/\\]/;
+  for (const f of files) {
+    if (!f.path.endsWith('.scss') && !f.path.endsWith('.css')) continue;
+
+    const fileId = generateId('File', f.path);
+    const seenClasses = new Set<string>();
+
+    for (const line of f.content.split('\n')) {
+      if (SCSS_SKIP_RE.test(line)) continue;
+      SCSS_CLASS_RE.lastIndex = 0;
+      let m;
+      while ((m = SCSS_CLASS_RE.exec(line)) !== null) {
+        const cls = m[1];
+        if (seenClasses.has(cls)) continue;
+        seenClasses.add(cls);
+
+        const nodeId = generateId('CodeElement', `${f.path}:.${cls}`);
+        result.nodes.push({
+          id: nodeId,
+          label: 'CodeElement',
+          properties: { name: `.${cls}`, filePath: f.path, startLine: 0, endLine: 0, language: SupportedLanguages.TypeScript, isExported: false },
+        });
+        result.relationships.push({
+          id: generateId('DEFINES', `${fileId}->${nodeId}`),
+          sourceId: fileId, targetId: nodeId, type: 'DEFINES', confidence: 1.0, reason: 'scss-class',
+        });
+      }
+    }
+    result.fileCount++;
+    onFileProcessed?.();
   }
 
   return result;
@@ -1042,6 +1222,297 @@ const processFileGroup = (
       }
     }
 
+    // Pre-pass: collect const string values and object literal string maps for channel name resolution.
+    // Collects: const FOO = 'bar' → constValueMap['FOO'] = 'bar'
+    //           const OBJ = { KEY: 'val' } → objectValueMap['OBJ']['KEY'] = 'val'
+    const constValueMap = new Map<string, string>();
+    const objectValueMap = new Map<string, Map<string, string>>();
+    if (language === SupportedLanguages.TypeScript || language === SupportedLanguages.JavaScript) {
+      // Walk top-level lexical_declaration nodes directly (not via query matches) to find:
+      //   const FOO = 'bar'  →  constValueMap['FOO'] = 'bar'
+      //   const OBJ = { KEY: 'val' }  →  objectValueMap['OBJ']['KEY'] = 'val'
+      const root = tree.rootNode;
+      for (let i = 0; i < root.childCount; i++) {
+        let declNode = root.child(i);
+        // Unwrap export_statement → declaration
+        if (declNode?.type === 'export_statement') {
+          declNode = declNode.childForFieldName?.('declaration') ?? declNode.namedChildren?.find((c: any) => c.type === 'lexical_declaration');
+        }
+        if (declNode?.type !== 'lexical_declaration') continue;
+        for (let j = 0; j < declNode.namedChildCount; j++) {
+          const varDecl = declNode.namedChild(j);
+          if (varDecl?.type !== 'variable_declarator') continue;
+          const nameNode = varDecl.childForFieldName?.('name');
+          const valueNode = varDecl.childForFieldName?.('value');
+          if (!nameNode || !valueNode || nameNode.type !== 'identifier') continue;
+          const varName = nameNode.text;
+          // Simple string: const FOO = 'bar'
+          if (valueNode.type === 'string') {
+            const frag = valueNode.namedChildren?.find((c: any) => c.type === 'string_fragment');
+            if (frag) constValueMap.set(varName, frag.text);
+          }
+          // Object literal: const OBJ = { KEY: 'val', KEY2: 'val2' }
+          if (valueNode.type === 'object') {
+            const objMap = new Map<string, string>();
+            for (let k = 0; k < valueNode.namedChildCount; k++) {
+              const pair = valueNode.namedChild(k);
+              if (pair?.type === 'pair') {
+                const key = pair.childForFieldName?.('key');
+                const val = pair.childForFieldName?.('value');
+                if (key && val?.type === 'string') {
+                  const frag = val.namedChildren?.find((c: any) => c.type === 'string_fragment');
+                  if (frag) objMap.set(key.text, frag.text);
+                }
+              }
+            }
+            if (objMap.size > 0) objectValueMap.set(varName, objMap);
+          }
+
+          // Destructure: const { A, B } = OBJ — resolve each prop against objectValueMap
+          if (nameNode.type === 'object_pattern' && valueNode.type === 'identifier') {
+            const srcObjName = valueNode.text;
+            const srcMap = objectValueMap.get(srcObjName);
+            for (let di = 0; di < nameNode.namedChildCount; di++) {
+              const prop = nameNode.namedChild(di);
+              if (prop?.type === 'shorthand_property_identifier_pattern') {
+                const propName = prop.text;
+                if (srcMap?.has(propName)) {
+                  // Same-file: resolve immediately
+                  constValueMap.set(propName, srcMap.get(propName)!);
+                } else {
+                  // Cross-file: store placeholder for post-parse resolution
+                  constValueMap.set(propName, `@${srcObjName}.${propName}`);
+                }
+              }
+            }
+          }
+        }
+      }
+      // Serialize const/object maps for cross-file resolution
+      if (constValueMap.size > 0 || objectValueMap.size > 0) {
+        const consts: [string, string][] = [];
+        for (const [k, v] of constValueMap) consts.push([k, v]);
+        const objectProps: [string, [string, string][]][] = [];
+        for (const [objName, props] of objectValueMap) {
+          const pairs: [string, string][] = [];
+          for (const [k, v] of props) pairs.push([k, v]);
+          objectProps.push([objName, pairs]);
+        }
+        result.constValues.push({ filePath: file.path, consts, objectProps });
+      }
+    }
+
+    // C# const field collection: private const string FIELD = "value" → constValueMap
+    if (language === SupportedLanguages.CSharp) {
+      const walkForConsts = (node: any): void => {
+        if (!node) return;
+        if (node.type === 'field_declaration') {
+          let isConst = false;
+          for (let i = 0; i < node.childCount; i++) {
+            const ch = node.child(i);
+            if (ch?.type === 'modifier' && ch.text === 'const') { isConst = true; break; }
+            if (ch?.isNamed && ch.type !== 'modifier') break;
+          }
+          if (isConst) {
+            const varDecl = node.namedChildren?.find((c: any) => c.type === 'variable_declaration');
+            if (varDecl) {
+              for (let j = 0; j < varDecl.namedChildCount; j++) {
+                const declarator = varDecl.namedChild(j);
+                if (declarator?.type === 'variable_declarator') {
+                  const nameNode = declarator.namedChildren?.find((c: any) => c.type === 'identifier');
+                  const literalNode = declarator.namedChildren?.find((c: any) => c.type === 'string_literal');
+                  if (nameNode && literalNode) {
+                    const contentNode = literalNode.namedChildren?.find((c: any) =>
+                      c.type === 'string_literal_content' || c.type === 'string_fragment');
+                    if (contentNode) {
+                      constValueMap.set(nameNode.text, contentNode.text);
+                    } else {
+                      const raw = literalNode.text;
+                      const val = raw.startsWith('"') && raw.endsWith('"') ? raw.slice(1, -1) : raw;
+                      if (val) constValueMap.set(nameNode.text, val);
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        for (let i = 0; i < node.childCount; i++) walkForConsts(node.child(i));
+      };
+      walkForConsts(tree.rootNode);
+
+      // Serialize for cross-file resolution
+      if (constValueMap.size > 0) {
+        const consts: [string, string][] = [];
+        for (const [k, v] of constValueMap) consts.push([k, v]);
+        result.constValues.push({ filePath: file.path, consts, objectProps: [] });
+      }
+    }
+
+    // Python const collection: MODULE_LEVEL_VAR = 'value' → constValueMap
+    if (language === SupportedLanguages.Python) {
+      const root = tree.rootNode;
+      for (let i = 0; i < root.childCount; i++) {
+        const stmt = root.child(i);
+        // expression_statement → assignment with identifier LHS and string RHS
+        if (stmt?.type === 'expression_statement') {
+          const assign = stmt.namedChildren?.find((c: any) => c.type === 'assignment');
+          if (assign) {
+            const left = assign.childForFieldName?.('left');
+            const right = assign.childForFieldName?.('right');
+            if (left?.type === 'identifier' && right?.type === 'string') {
+              const content = right.namedChildren?.find((c: any) => c.type === 'string_content');
+              if (content) constValueMap.set(left.text, content.text);
+            }
+          }
+        }
+      }
+      if (constValueMap.size > 0) {
+        const consts: [string, string][] = [];
+        for (const [k, v] of constValueMap) consts.push([k, v]);
+        result.constValues.push({ filePath: file.path, consts, objectProps: [] });
+      }
+    }
+
+    // Java const collection: static final String FIELD = "value" → constValueMap
+    if (language === SupportedLanguages.Java) {
+      const walkJavaConsts = (node: any): void => {
+        if (!node) return;
+        if (node.type === 'field_declaration') {
+          // Check for static final modifiers
+          let isStatic = false, isFinal = false;
+          for (let i = 0; i < node.childCount; i++) {
+            const ch = node.child(i);
+            if (ch?.type === 'modifiers') {
+              const modText = ch.text;
+              if (modText.includes('static')) isStatic = true;
+              if (modText.includes('final')) isFinal = true;
+            }
+          }
+          if (isStatic && isFinal) {
+            const declarator = node.namedChildren?.find((c: any) => c.type === 'variable_declarator');
+            if (declarator) {
+              const nameNode = declarator.childForFieldName?.('name');
+              const valueNode = declarator.childForFieldName?.('value');
+              if (nameNode?.type === 'identifier' && valueNode?.type === 'string_literal') {
+                const raw = valueNode.text;
+                const val = raw.startsWith('"') && raw.endsWith('"') ? raw.slice(1, -1) : raw;
+                if (val) constValueMap.set(nameNode.text, val);
+              }
+            }
+          }
+        }
+        for (let i = 0; i < node.childCount; i++) walkJavaConsts(node.child(i));
+      };
+      walkJavaConsts(tree.rootNode);
+      if (constValueMap.size > 0) {
+        const consts: [string, string][] = [];
+        for (const [k, v] of constValueMap) consts.push([k, v]);
+        result.constValues.push({ filePath: file.path, consts, objectProps: [] });
+      }
+    }
+
+    // Go const collection: const Subject = "value" → constValueMap
+    if (language === SupportedLanguages.Go) {
+      const root = tree.rootNode;
+      for (let i = 0; i < root.childCount; i++) {
+        const node = root.child(i);
+        if (node?.type === 'const_declaration') {
+          for (let j = 0; j < node.namedChildCount; j++) {
+            const spec = node.namedChild(j);
+            if (spec?.type === 'const_spec') {
+              const nameNode = spec.childForFieldName?.('name');
+              const valueNode = spec.childForFieldName?.('value');
+              // Go may use expression_list for the value side
+              const valNode = valueNode?.type === 'expression_list'
+                ? valueNode.namedChildren?.[0]
+                : valueNode;
+              if (nameNode?.type === 'identifier' && valNode?.type === 'interpreted_string_literal') {
+                const raw = valNode.text;
+                const val = raw.startsWith('"') && raw.endsWith('"') ? raw.slice(1, -1) : raw;
+                if (val) constValueMap.set(nameNode.text, val);
+              }
+            }
+          }
+        }
+      }
+      if (constValueMap.size > 0) {
+        const consts: [string, string][] = [];
+        for (const [k, v] of constValueMap) consts.push([k, v]);
+        result.constValues.push({ filePath: file.path, consts, objectProps: [] });
+      }
+    }
+
+    // PHP const collection: const HOOK = 'value' and define('CONST', 'value') → constValueMap
+    if (language === SupportedLanguages.PHP) {
+      const walkPhpConsts = (node: any): void => {
+        if (!node) return;
+        // const HOOK = 'value';
+        if (node.type === 'const_declaration') {
+          for (let j = 0; j < node.namedChildCount; j++) {
+            const elem = node.namedChild(j);
+            if (elem?.type === 'const_element') {
+              const nameNode = elem.childForFieldName?.('name');
+              const valueNode = elem.childForFieldName?.('value');
+              if (nameNode && valueNode?.type === 'string') {
+                const content = valueNode.namedChildren?.find((c: any) => c.type === 'string_content');
+                if (content) constValueMap.set(nameNode.text, content.text);
+              }
+            }
+          }
+        }
+        // define('CONST_NAME', 'value')
+        if (node.type === 'function_call_expression') {
+          const funcName = node.childForFieldName?.('function');
+          if (funcName?.type === 'name' && funcName.text === 'define') {
+            const args = node.childForFieldName?.('arguments');
+            if (args) {
+              const argNodes = args.namedChildren?.filter((c: any) => c.type === 'argument') ?? [];
+              if (argNodes.length >= 2) {
+                const nameArg = argNodes[0].namedChildren?.find((c: any) => c.type === 'string');
+                const valArg = argNodes[1].namedChildren?.find((c: any) => c.type === 'string');
+                if (nameArg && valArg) {
+                  const nameContent = nameArg.namedChildren?.find((c: any) => c.type === 'string_content');
+                  const valContent = valArg.namedChildren?.find((c: any) => c.type === 'string_content');
+                  if (nameContent && valContent) constValueMap.set(nameContent.text, valContent.text);
+                }
+              }
+            }
+          }
+        }
+        for (let i = 0; i < node.childCount; i++) walkPhpConsts(node.child(i));
+      };
+      walkPhpConsts(tree.rootNode);
+      if (constValueMap.size > 0) {
+        const consts: [string, string][] = [];
+        for (const [k, v] of constValueMap) consts.push([k, v]);
+        result.constValues.push({ filePath: file.path, consts, objectProps: [] });
+      }
+    }
+
+    // Ruby const collection: CONSTANT = 'value' → constValueMap
+    if (language === SupportedLanguages.Ruby) {
+      const root = tree.rootNode;
+      const walkRubyConsts = (node: any): void => {
+        if (!node) return;
+        if (node.type === 'assignment') {
+          const left = node.childForFieldName?.('left');
+          const right = node.childForFieldName?.('right');
+          if (left?.type === 'constant' && right?.type === 'string') {
+            const content = right.namedChildren?.find((c: any) => c.type === 'string_content');
+            if (content) constValueMap.set(left.text, content.text);
+          }
+        }
+        for (let i = 0; i < node.childCount; i++) walkRubyConsts(node.child(i));
+      };
+      walkRubyConsts(root);
+      if (constValueMap.size > 0) {
+        const consts: [string, string][] = [];
+        for (const [k, v] of constValueMap) consts.push([k, v]);
+        result.constValues.push({ filePath: file.path, consts, objectProps: [] });
+      }
+    }
+
     // Build per-file type environment + constructor bindings in a single AST walk.
     // Constructor bindings are verified against the SymbolTable in processCallsFromExtracted.
     const parentMap: ReadonlyMap<string, readonly string[]> = fileParentMap;
@@ -1133,6 +1604,595 @@ const processFileGroup = (
         if (decoratorName === 'tool') {
           // Re-store with isTool flag for the definition handler
           fileDecorators.set(decoratorNode.endPosition.row, { name: decoratorName, arg: decoratorArg, isTool: true });
+        }
+        continue;
+      }
+
+      // ── Extract React Context references (Provider → Consumer data flow) ──
+
+      // useContext(ContextName) — consumer side
+      if (captureMap['context.consumer'] && captureMap['context.consumed']) {
+        const contextName = captureMap['context.consumed'].text;
+        const enclosingId = findEnclosingFunctionId(captureMap['context.consumer'], file.path, provider) ?? generateId('File', file.path);
+        result.contextRefs.push({
+          filePath: file.path, contextName, role: 'consumer',
+          enclosingSymbolId: enclosingId,
+          lineNumber: captureMap['context.consumer'].startPosition.row,
+        });
+        continue;
+      }
+
+      // <Context.Provider> — provider side
+      if (captureMap['context.provider'] && captureMap['context.provider.name']) {
+        const contextName = captureMap['context.provider.name'].text;
+        const enclosingId = findEnclosingFunctionId(captureMap['context.provider'], file.path, provider) ?? generateId('File', file.path);
+        result.contextRefs.push({
+          filePath: file.path, contextName, role: 'provider',
+          enclosingSymbolId: enclosingId,
+          lineNumber: captureMap['context.provider'].startPosition.row,
+        });
+        continue;
+      }
+
+      // ── Extract message channel references (Electron IPC, Socket.IO, EventEmitter) ──
+      // MUST run before http_client/express_route — those broad patterns also match IPC calls
+
+      // Electron IPC consumer: ipcMain.handle('channel', fn), ipcMain.on('channel', fn)
+      if (captureMap['channel.consumer'] && captureMap['channel.name'] && captureMap['channel.method']) {
+        const methodName = captureMap['channel.method'].text;
+        if (methodName === 'handle' || methodName === 'on') {
+          const channelName = captureMap['channel.name'].text;
+          const enclosingId = findEnclosingFunctionId(captureMap['channel.consumer'], file.path, provider) ?? generateId('File', file.path);
+          result.channels.push({
+            filePath: file.path, channelName, role: 'consumer',
+            transport: 'electron-ipc', enclosingSymbolId: enclosingId,
+            lineNumber: captureMap['channel.consumer'].startPosition.row,
+          });
+        }
+        continue;
+      }
+
+      // Electron IPC producer: ipcRenderer.invoke('channel'), ipcRenderer.send('channel'), ipcRenderer.sendSync('channel')
+      if (captureMap['channel.producer'] && captureMap['channel.name'] && captureMap['channel.method']) {
+        const methodName = captureMap['channel.method'].text;
+        if (methodName === 'invoke' || methodName === 'send' || methodName === 'sendSync') {
+          const channelName = captureMap['channel.name'].text;
+          const enclosingId = findEnclosingFunctionId(captureMap['channel.producer'], file.path, provider) ?? generateId('File', file.path);
+          result.channels.push({
+            filePath: file.path, channelName, role: 'producer',
+            transport: 'electron-ipc', enclosingSymbolId: enclosingId,
+            lineNumber: captureMap['channel.producer'].startPosition.row,
+          });
+        }
+        continue;
+      }
+
+      // Electron IPC push: webContents.send('channel') — main → renderer
+      if (captureMap['channel.producer.webcontents'] && captureMap['channel.name']) {
+        const channelName = captureMap['channel.name'].text;
+        const enclosingId = findEnclosingFunctionId(captureMap['channel.producer.webcontents'], file.path, provider) ?? generateId('File', file.path);
+        result.channels.push({
+          filePath: file.path, channelName, role: 'producer',
+          transport: 'electron-ipc', enclosingSymbolId: enclosingId,
+          lineNumber: captureMap['channel.producer.webcontents'].startPosition.row,
+        });
+        continue;
+      }
+
+      // Socket.IO / EventEmitter consumer: socket.on('event', fn), emitter.on('event', fn)
+      if (captureMap['channel.consumer.socket'] && captureMap['channel.name']) {
+        const channelName = captureMap['channel.name'].text;
+        // Skip built-in socket lifecycle events that aren't message channels
+        if (!SKIP_CHANNEL_NAMES.has(channelName)) {
+          const enclosingId = findEnclosingFunctionId(captureMap['channel.consumer.socket'], file.path, provider) ?? generateId('File', file.path);
+          const objName = captureMap['channel.object']?.text ?? '';
+          const transport = (objName === 'socket' || objName === 'io') ? 'socket.io' as const : 'event-emitter' as const;
+          result.channels.push({
+            filePath: file.path, channelName, role: 'consumer',
+            transport, enclosingSymbolId: enclosingId,
+            lineNumber: captureMap['channel.consumer.socket'].startPosition.row,
+          });
+        }
+        continue;
+      }
+
+      // Socket.IO / EventEmitter producer: socket.emit('event', data), emitter.emit('event', data)
+      if (captureMap['channel.producer.socket'] && captureMap['channel.name']) {
+        const channelName = captureMap['channel.name'].text;
+        const enclosingId = findEnclosingFunctionId(captureMap['channel.producer.socket'], file.path, provider) ?? generateId('File', file.path);
+        const objName = captureMap['channel.object']?.text ?? '';
+        const transport = (objName === 'socket' || objName === 'io') ? 'socket.io' as const : 'event-emitter' as const;
+        result.channels.push({
+          filePath: file.path, channelName, role: 'producer',
+          transport, enclosingSymbolId: enclosingId,
+          lineNumber: captureMap['channel.producer.socket'].startPosition.row,
+        });
+        continue;
+      }
+
+      // C# channel patterns: obj.On("event", handler), obj.Emit("event", data)
+      if (captureMap['channel.csharp'] && captureMap['channel.name'] && captureMap['channel.method']) {
+        const methodName = captureMap['channel.method'].text;
+        const rawName = captureMap['channel.name'].text;
+        // Strip C# string literal quotes: "event" → event
+        const channelName = rawName.replace(/^["']|["']$/g, '');
+        if (channelName && (methodName === 'On' || methodName === 'OnRequest' || methodName === 'OnResponse'
+            || methodName === 'Emit' || methodName === 'EmitRequest' || methodName === 'EmitFailure')) {
+          const role = methodName.startsWith('On') ? 'consumer' as const : 'producer' as const;
+          const enclosingId = findEnclosingFunctionId(captureMap['channel.csharp'], file.path, provider) ?? generateId('File', file.path);
+          result.channels.push({
+            filePath: file.path, channelName, role,
+            transport: 'csharp-emitter', enclosingSymbolId: enclosingId,
+            lineNumber: captureMap['channel.csharp'].startPosition.row,
+          });
+        }
+        continue;
+      }
+
+      // Socket.IO/EventEmitter with const variable: socket.emit(SOME_CONST, data)
+      if ((captureMap['channel.consumer.socket.var'] || captureMap['channel.producer.socket.var']) && captureMap['channel.name.var']) {
+        const varName = captureMap['channel.name.var'].text;
+        const channelName = constValueMap.get(varName);
+        if (channelName) {
+          const isConsumer = !!captureMap['channel.consumer.socket.var'];
+          const enclosingId = findEnclosingFunctionId(
+            captureMap['channel.consumer.socket.var'] ?? captureMap['channel.producer.socket.var'],
+            file.path, provider
+          ) ?? generateId('File', file.path);
+          const objName = captureMap['channel.object']?.text ?? '';
+          const transport = (objName === 'socket' || objName === 'io') ? 'socket.io' as const : 'event-emitter' as const;
+          // Skip lifecycle events
+          if (!SKIP_CHANNEL_NAMES.has(channelName)) {
+            result.channels.push({
+              filePath: file.path, channelName,
+              role: isConsumer ? 'consumer' : 'producer',
+              transport, enclosingSymbolId: enclosingId,
+              lineNumber: (captureMap['channel.consumer.socket.var'] ?? captureMap['channel.producer.socket.var']).startPosition.row,
+            });
+          }
+        }
+        continue;
+      }
+
+      // Socket.IO/EventEmitter with member expression: socket.on(OBJ.PROP, fn)
+      if ((captureMap['channel.consumer.socket.member'] || captureMap['channel.producer.socket.member']) && captureMap['channel.ref.obj'] && captureMap['channel.ref.prop']) {
+        const refObj = captureMap['channel.ref.obj'].text;
+        const refProp = captureMap['channel.ref.prop'].text;
+        // Try same-file object value map first
+        let channelName = objectValueMap.get(refObj)?.get(refProp);
+        // If not found, store placeholder for cross-file resolution: @ObjName.PropName
+        if (!channelName) channelName = `@${refObj}.${refProp}`;
+        const isConsumer = !!captureMap['channel.consumer.socket.member'];
+        const enclosingId = findEnclosingFunctionId(
+          captureMap['channel.consumer.socket.member'] ?? captureMap['channel.producer.socket.member'],
+          file.path, provider
+        ) ?? generateId('File', file.path);
+        const objName = captureMap['channel.object']?.text ?? '';
+        // For chained calls like getIO().on(OBJ.PROP), channel.object is absent — default to socket.io
+        const transport = (!objName || objName === 'socket' || objName === 'io') ? 'socket.io' as const : 'event-emitter' as const;
+        if (!SKIP_CHANNEL_NAMES.has(channelName)) {
+          result.channels.push({
+            filePath: file.path, channelName,
+            role: isConsumer ? 'consumer' : 'producer',
+            transport, enclosingSymbolId: enclosingId,
+            lineNumber: (captureMap['channel.consumer.socket.member'] ?? captureMap['channel.producer.socket.member']).startPosition.row,
+          });
+        }
+        continue;
+      }
+
+      // C# Socket.IO wrapper with const variable: _socket.Emit(SOME_CONST, data)
+      if (captureMap['channel.csharp.var'] && captureMap['channel.name.var'] && captureMap['channel.method']) {
+        const methodName = captureMap['channel.method'].text;
+        const varName = captureMap['channel.name.var'].text;
+        if (methodName === 'On' || methodName === 'OnRequest' || methodName === 'OnResponse'
+            || methodName === 'Emit' || methodName === 'EmitRequest' || methodName === 'EmitFailure') {
+          const role = methodName.startsWith('On') ? 'consumer' as const : 'producer' as const;
+          const enclosingId = findEnclosingFunctionId(captureMap['channel.csharp.var'], file.path, provider) ?? generateId('File', file.path);
+          // Resolve const field to string value if available
+          const channelName = constValueMap.get(varName) ?? varName;
+          result.channels.push({
+            filePath: file.path, channelName, role,
+            transport: 'csharp-emitter', enclosingSymbolId: enclosingId,
+            lineNumber: captureMap['channel.csharp.var'].startPosition.row,
+          });
+        }
+        continue;
+      }
+
+      // C# event fire: OnConnected?.Invoke(this, args)
+      if (captureMap['event.fire'] && captureMap['event.fire.name']) {
+        const eventName = captureMap['event.fire.name'].text;
+        const enclosingId = findEnclosingFunctionId(captureMap['event.fire'], file.path, provider) ?? generateId('File', file.path);
+        result.eventRefs.push({
+          filePath: file.path, eventName, role: 'fire',
+          enclosingSymbolId: enclosingId,
+          lineNumber: captureMap['event.fire'].startPosition.row,
+        });
+        continue;
+      }
+
+      // C# event subscription: obj.OnConnected += handler
+      if (captureMap['event.subscribe'] && captureMap['event.name']) {
+        const eventName = captureMap['event.name'].text;
+        const receiverText = captureMap['event.receiver']?.text;
+        const handlerNode = captureMap['event.handler'];
+        const handlerName = handlerNode?.type === 'identifier' ? handlerNode.text : undefined;
+        const enclosingId = findEnclosingFunctionId(captureMap['event.subscribe'], file.path, provider) ?? generateId('File', file.path);
+        result.eventRefs.push({
+          filePath: file.path, eventName, role: 'subscribe',
+          enclosingSymbolId: enclosingId,
+          receiverText, handlerName,
+          lineNumber: captureMap['event.subscribe'].startPosition.row,
+        });
+        continue;
+      }
+
+      // ── Python channel captures (Socket.IO, EventEmitter, Celery, Redis) ──────
+
+      // Python Socket.IO / EventEmitter: obj.emit('event') or obj.on('event')
+      if ((captureMap['channel.producer.py'] || captureMap['channel.consumer.py']) && captureMap['channel.name']) {
+        const channelName = captureMap['channel.name'].text;
+        if (!SKIP_CHANNEL_NAMES.has(channelName)) {
+          const isProducer = !!captureMap['channel.producer.py'];
+          const anchorNode = captureMap['channel.producer.py'] ?? captureMap['channel.consumer.py'];
+          const enclosingId = findEnclosingFunctionId(anchorNode, file.path, provider) ?? generateId('File', file.path);
+          const objName = (captureMap['channel.py.object']?.text ?? '').toLowerCase();
+          const transport = (objName.includes('socket') || objName.includes('sio') || objName === 'socketio')
+            ? 'python-socketio' as const : 'python-event-emitter' as const;
+          result.channels.push({
+            filePath: file.path, channelName, role: isProducer ? 'producer' : 'consumer',
+            transport, enclosingSymbolId: enclosingId,
+            lineNumber: anchorNode.startPosition.row,
+          });
+        }
+        continue;
+      }
+
+      // Python decorator listener: @socketio.on('event')
+      if (captureMap['channel.consumer.py.decorator'] && captureMap['channel.name']) {
+        const channelName = captureMap['channel.name'].text;
+        if (!SKIP_CHANNEL_NAMES.has(channelName)) {
+          const enclosingId = findEnclosingFunctionId(captureMap['channel.consumer.py.decorator'], file.path, provider) ?? generateId('File', file.path);
+          const objName = (captureMap['channel.py.deco.object']?.text ?? '').toLowerCase();
+          const transport = (objName.includes('socket') || objName.includes('sio') || objName === 'socketio')
+            ? 'python-socketio' as const : 'python-event-emitter' as const;
+          result.channels.push({
+            filePath: file.path, channelName, role: 'consumer',
+            transport, enclosingSymbolId: enclosingId,
+            lineNumber: captureMap['channel.consumer.py.decorator'].startPosition.row,
+          });
+        }
+        continue;
+      }
+
+      // Python @sio.event / @socketio.event — event name = function name
+      if (captureMap['channel.consumer.py.event'] && captureMap['channel.name']) {
+        const channelName = captureMap['channel.name'].text;
+        if (!SKIP_CHANNEL_NAMES.has(channelName)) {
+          const enclosingId = findEnclosingFunctionId(captureMap['channel.consumer.py.event'], file.path, provider) ?? generateId('File', file.path);
+          const objName = (captureMap['channel.py.event.object']?.text ?? '').toLowerCase();
+          const transport = (objName.includes('socket') || objName.includes('sio') || objName === 'socketio')
+            ? 'python-socketio' as const : 'python-event-emitter' as const;
+          result.channels.push({
+            filePath: file.path, channelName, role: 'consumer',
+            transport, enclosingSymbolId: enclosingId,
+            lineNumber: captureMap['channel.consumer.py.event'].startPosition.row,
+          });
+        }
+        continue;
+      }
+
+      // Python Socket.IO / EventEmitter with variable: obj.emit(VARIABLE)
+      if ((captureMap['channel.producer.py.var'] || captureMap['channel.consumer.py.var']) && captureMap['channel.name.var']) {
+        const varName = captureMap['channel.name.var'].text;
+        const channelName = constValueMap.get(varName);
+        if (channelName && !SKIP_CHANNEL_NAMES.has(channelName)) {
+          const isProducer = !!captureMap['channel.producer.py.var'];
+          const anchorNode = captureMap['channel.producer.py.var'] ?? captureMap['channel.consumer.py.var'];
+          const enclosingId = findEnclosingFunctionId(anchorNode, file.path, provider) ?? generateId('File', file.path);
+          const objName = (captureMap['channel.py.var.object']?.text ?? '').toLowerCase();
+          const transport = (objName.includes('socket') || objName.includes('sio') || objName === 'socketio')
+            ? 'python-socketio' as const : 'python-event-emitter' as const;
+          result.channels.push({
+            filePath: file.path, channelName, role: isProducer ? 'producer' : 'consumer',
+            transport, enclosingSymbolId: enclosingId,
+            lineNumber: anchorNode.startPosition.row,
+          });
+        }
+        continue;
+      }
+
+      // Celery send_task producer: app.send_task('task.name')
+      if (captureMap['channel.producer.celery'] && captureMap['channel.name']) {
+        const channelName = captureMap['channel.name'].text;
+        const enclosingId = findEnclosingFunctionId(captureMap['channel.producer.celery'], file.path, provider) ?? generateId('File', file.path);
+        result.channels.push({
+          filePath: file.path, channelName, role: 'producer',
+          transport: 'python-celery', enclosingSymbolId: enclosingId,
+          lineNumber: captureMap['channel.producer.celery'].startPosition.row,
+        });
+        continue;
+      }
+
+      // Celery task decorator consumer: @app.task(name='task.name'), @shared_task(name='task.name')
+      if (captureMap['channel.consumer.celery'] && captureMap['channel.name']) {
+        const channelName = captureMap['channel.name'].text;
+        const enclosingId = findEnclosingFunctionId(captureMap['channel.consumer.celery'], file.path, provider) ?? generateId('File', file.path);
+        result.channels.push({
+          filePath: file.path, channelName, role: 'consumer',
+          transport: 'python-celery', enclosingSymbolId: enclosingId,
+          lineNumber: captureMap['channel.consumer.celery'].startPosition.row,
+        });
+        continue;
+      }
+
+      // Redis publish/subscribe
+      if ((captureMap['channel.producer.redis'] || captureMap['channel.consumer.redis']) && captureMap['channel.name']) {
+        const channelName = captureMap['channel.name'].text;
+        const isProducer = !!captureMap['channel.producer.redis'];
+        const anchorNode = captureMap['channel.producer.redis'] ?? captureMap['channel.consumer.redis'];
+        const enclosingId = findEnclosingFunctionId(anchorNode, file.path, provider) ?? generateId('File', file.path);
+        result.channels.push({
+          filePath: file.path, channelName, role: isProducer ? 'producer' : 'consumer',
+          transport: 'python-redis-pubsub', enclosingSymbolId: enclosingId,
+          lineNumber: anchorNode.startPosition.row,
+        });
+        continue;
+      }
+
+      // ── Java channel captures (Kafka, JMS, RabbitMQ) ──────────────────────
+
+      // Java method call with string first arg: template.send("topic", msg)
+      if (captureMap['channel.java'] && captureMap['channel.name'] && captureMap['channel.java.method']) {
+        const methodName = captureMap['channel.java.method'].text;
+        if (methodName === 'send' || methodName === 'convertAndSend' || methodName === 'sendDefault') {
+          const rawName = captureMap['channel.name'].text;
+          const channelName = rawName.startsWith('"') && rawName.endsWith('"') ? rawName.slice(1, -1) : rawName;
+          if (channelName) {
+            const enclosingId = findEnclosingFunctionId(captureMap['channel.java'], file.path, provider) ?? generateId('File', file.path);
+            const objName = (captureMap['channel.java.object']?.text ?? '').toLowerCase();
+            let transport: 'java-kafka' | 'java-jms' | 'java-rabbitmq' = 'java-kafka';
+            if (objName.includes('jms')) transport = 'java-jms';
+            else if (objName.includes('rabbit')) transport = 'java-rabbitmq';
+            result.channels.push({
+              filePath: file.path, channelName, role: 'producer',
+              transport, enclosingSymbolId: enclosingId,
+              lineNumber: captureMap['channel.java'].startPosition.row,
+            });
+          }
+        }
+        continue;
+      }
+
+      // Java annotation consumer: @KafkaListener(topics = "topic"), @JmsListener(destination = "dest"), @RabbitListener(queues = "queue")
+      if ((captureMap['channel.java.annotation'] || captureMap['channel.java.annotation.array']) && captureMap['channel.name'] && captureMap['channel.java.annotation.name']) {
+        const annotName = captureMap['channel.java.annotation.name'].text;
+        const attrKey = captureMap['channel.java.annotation.key']?.text ?? '';
+        // Validate annotation + attribute combination
+        const validAnnotation =
+          (annotName === 'KafkaListener' && (attrKey === 'topics' || attrKey === 'value')) ||
+          (annotName === 'JmsListener' && (attrKey === 'destination' || attrKey === 'value')) ||
+          (annotName === 'RabbitListener' && (attrKey === 'queues' || attrKey === 'value'));
+        if (validAnnotation) {
+          const rawName = captureMap['channel.name'].text;
+          const channelName = rawName.startsWith('"') && rawName.endsWith('"') ? rawName.slice(1, -1) : rawName;
+          if (channelName) {
+            const anchorNode = captureMap['channel.java.annotation'] ?? captureMap['channel.java.annotation.array'];
+            const enclosingId = findEnclosingFunctionId(anchorNode, file.path, provider) ?? generateId('File', file.path);
+            let transport: 'java-kafka' | 'java-jms' | 'java-rabbitmq' = 'java-kafka';
+            if (annotName === 'JmsListener') transport = 'java-jms';
+            else if (annotName === 'RabbitListener') transport = 'java-rabbitmq';
+            result.channels.push({
+              filePath: file.path, channelName, role: 'consumer',
+              transport, enclosingSymbolId: enclosingId,
+              lineNumber: anchorNode.startPosition.row,
+            });
+          }
+        }
+        continue;
+      }
+
+      // Java method call with const variable: template.send(TOPIC_CONST, msg)
+      if (captureMap['channel.java.var'] && captureMap['channel.name.var'] && captureMap['channel.java.var.method']) {
+        const methodName = captureMap['channel.java.var.method'].text;
+        if (methodName === 'send' || methodName === 'convertAndSend' || methodName === 'sendDefault') {
+          const varName = captureMap['channel.name.var'].text;
+          const channelName = constValueMap.get(varName);
+          if (channelName) {
+            const enclosingId = findEnclosingFunctionId(captureMap['channel.java.var'], file.path, provider) ?? generateId('File', file.path);
+            const objName = (captureMap['channel.java.var.object']?.text ?? '').toLowerCase();
+            let transport: 'java-kafka' | 'java-jms' | 'java-rabbitmq' = 'java-kafka';
+            if (objName.includes('jms')) transport = 'java-jms';
+            else if (objName.includes('rabbit')) transport = 'java-rabbitmq';
+            result.channels.push({
+              filePath: file.path, channelName, role: 'producer',
+              transport, enclosingSymbolId: enclosingId,
+              lineNumber: captureMap['channel.java.var'].startPosition.row,
+            });
+          }
+        }
+        continue;
+      }
+
+      // ── PHP channel captures (WordPress, Laravel, Symfony) ──────────────────
+
+      // WordPress do_action / apply_filters (producers)
+      if ((captureMap['channel.producer.wp'] || captureMap['channel.producer.wp.filter']) && captureMap['channel.name']) {
+        const channelName = captureMap['channel.name'].text;
+        const anchorNode = captureMap['channel.producer.wp'] ?? captureMap['channel.producer.wp.filter'];
+        const enclosingId = findEnclosingFunctionId(anchorNode, file.path, provider) ?? generateId('File', file.path);
+        result.channels.push({
+          filePath: file.path, channelName, role: 'producer',
+          transport: 'php-wordpress-hook', enclosingSymbolId: enclosingId,
+          lineNumber: anchorNode.startPosition.row,
+        });
+        continue;
+      }
+
+      // WordPress add_action / add_filter / has_action / has_filter / remove_action / remove_filter (consumers)
+      if ((captureMap['channel.consumer.wp'] || captureMap['channel.consumer.wp.filter'] || captureMap['channel.consumer.wp.ref']) && captureMap['channel.name']) {
+        const channelName = captureMap['channel.name'].text;
+        const anchorNode = captureMap['channel.consumer.wp'] ?? captureMap['channel.consumer.wp.filter'] ?? captureMap['channel.consumer.wp.ref'];
+        const enclosingId = findEnclosingFunctionId(anchorNode, file.path, provider) ?? generateId('File', file.path);
+        result.channels.push({
+          filePath: file.path, channelName, role: 'consumer',
+          transport: 'php-wordpress-hook', enclosingSymbolId: enclosingId,
+          lineNumber: anchorNode.startPosition.row,
+        });
+        continue;
+      }
+
+      // Laravel event() dispatch (producer) and Event::listen/dispatch (producer/consumer)
+      if (captureMap['channel.producer.laravel'] && captureMap['channel.name']) {
+        const channelName = captureMap['channel.name'].text;
+        const enclosingId = findEnclosingFunctionId(captureMap['channel.producer.laravel'], file.path, provider) ?? generateId('File', file.path);
+        result.channels.push({
+          filePath: file.path, channelName, role: 'producer',
+          transport: 'php-laravel-event', enclosingSymbolId: enclosingId,
+          lineNumber: captureMap['channel.producer.laravel'].startPosition.row,
+        });
+        continue;
+      }
+
+      if (captureMap['channel.consumer.laravel'] && captureMap['channel.name']) {
+        const channelName = captureMap['channel.name'].text;
+        const enclosingId = findEnclosingFunctionId(captureMap['channel.consumer.laravel'], file.path, provider) ?? generateId('File', file.path);
+        result.channels.push({
+          filePath: file.path, channelName, role: 'consumer',
+          transport: 'php-laravel-event', enclosingSymbolId: enclosingId,
+          lineNumber: captureMap['channel.consumer.laravel'].startPosition.row,
+        });
+        continue;
+      }
+
+      // Symfony dispatch (producer) / addListener / removeListener (consumer)
+      if (captureMap['channel.producer.symfony'] && captureMap['channel.name']) {
+        const channelName = captureMap['channel.name'].text;
+        const enclosingId = findEnclosingFunctionId(captureMap['channel.producer.symfony'], file.path, provider) ?? generateId('File', file.path);
+        result.channels.push({
+          filePath: file.path, channelName, role: 'producer',
+          transport: 'php-symfony-event', enclosingSymbolId: enclosingId,
+          lineNumber: captureMap['channel.producer.symfony'].startPosition.row,
+        });
+        continue;
+      }
+
+      if (captureMap['channel.consumer.symfony'] && captureMap['channel.name']) {
+        const channelName = captureMap['channel.name'].text;
+        const enclosingId = findEnclosingFunctionId(captureMap['channel.consumer.symfony'], file.path, provider) ?? generateId('File', file.path);
+        result.channels.push({
+          filePath: file.path, channelName, role: 'consumer',
+          transport: 'php-symfony-event', enclosingSymbolId: enclosingId,
+          lineNumber: captureMap['channel.consumer.symfony'].startPosition.row,
+        });
+        continue;
+      }
+
+      // ── Go channel captures (NATS pub/sub) ────────────────────────────────
+
+      // Go NATS Publish/Subscribe with string literal
+      if ((captureMap['channel.producer.go'] || captureMap['channel.consumer.go']) && captureMap['channel.name']) {
+        const rawName = captureMap['channel.name'].text;
+        // Go string literals include quotes: "subject" → subject
+        const channelName = rawName.startsWith('"') && rawName.endsWith('"') ? rawName.slice(1, -1) : rawName;
+        if (channelName) {
+          const isProducer = !!captureMap['channel.producer.go'];
+          const anchorNode = captureMap['channel.producer.go'] ?? captureMap['channel.consumer.go'];
+          const enclosingId = findEnclosingFunctionId(anchorNode, file.path, provider) ?? generateId('File', file.path);
+          result.channels.push({
+            filePath: file.path, channelName, role: isProducer ? 'producer' : 'consumer',
+            transport: 'go-nats', enclosingSymbolId: enclosingId,
+            lineNumber: anchorNode.startPosition.row,
+          });
+        }
+        continue;
+      }
+
+      // Go NATS with const variable
+      if ((captureMap['channel.producer.go.var'] || captureMap['channel.consumer.go.var']) && captureMap['channel.name.var']) {
+        const varName = captureMap['channel.name.var'].text;
+        const channelName = constValueMap.get(varName);
+        if (channelName) {
+          const isProducer = !!captureMap['channel.producer.go.var'];
+          const anchorNode = captureMap['channel.producer.go.var'] ?? captureMap['channel.consumer.go.var'];
+          const enclosingId = findEnclosingFunctionId(anchorNode, file.path, provider) ?? generateId('File', file.path);
+          result.channels.push({
+            filePath: file.path, channelName, role: isProducer ? 'producer' : 'consumer',
+            transport: 'go-nats', enclosingSymbolId: enclosingId,
+            lineNumber: anchorNode.startPosition.row,
+          });
+        }
+        continue;
+      }
+
+      // ── Ruby channel captures (ActiveSupport::Notifications) ──────────────
+
+      if ((captureMap['channel.producer.ruby'] || captureMap['channel.consumer.ruby']) && captureMap['channel.name']) {
+        const channelName = captureMap['channel.name'].text;
+        const isProducer = !!captureMap['channel.producer.ruby'];
+        const anchorNode = captureMap['channel.producer.ruby'] ?? captureMap['channel.consumer.ruby'];
+        const enclosingId = findEnclosingFunctionId(anchorNode, file.path, provider) ?? generateId('File', file.path);
+        result.channels.push({
+          filePath: file.path, channelName, role: isProducer ? 'producer' : 'consumer',
+          transport: 'ruby-activesupport', enclosingSymbolId: enclosingId,
+          lineNumber: anchorNode.startPosition.row,
+        });
+        continue;
+      }
+
+      // ── Swift channel captures (NotificationCenter) ────────────────────────
+
+      if ((captureMap['channel.producer.swift'] || captureMap['channel.consumer.swift']) && captureMap['channel.name']) {
+        const nameNode = captureMap['channel.name'];
+        let channelName: string | undefined;
+
+        if (nameNode.type === 'prefix_expression') {
+          // .eventName → prefix_expression with "." + simple_identifier
+          // Extract the simple_identifier child
+          const idChild = nameNode.namedChildren?.find((c: any) => c.type === 'simple_identifier');
+          channelName = idChild?.text;
+        } else if (nameNode.type === 'call_expression') {
+          // Notification.Name(variableOrString) → extract the argument
+          const suffix = nameNode.namedChildren?.find((c: any) => c.type === 'call_suffix');
+          const args = suffix?.namedChildren?.find((c: any) => c.type === 'value_arguments');
+          const firstArg = args?.namedChildren?.find((c: any) => c.type === 'value_argument');
+          if (firstArg) {
+            // Could be a string literal or a variable identifier
+            const strNode = firstArg.namedChildren?.find((c: any) => c.type === 'line_string_literal');
+            if (strNode) {
+              // String literal: Notification.Name("myEvent")
+              const content = strNode.namedChildren?.find((c: any) => c.type === 'line_str_text');
+              channelName = content?.text ?? strNode.text?.replace(/"/g, '');
+            } else {
+              // Variable: Notification.Name(varName) → try const resolution
+              const idNode = firstArg.namedChildren?.find((c: any) => c.type === 'simple_identifier');
+              if (idNode) {
+                channelName = constValueMap.get(idNode.text) ?? idNode.text;
+              }
+            }
+          }
+        } else if (nameNode.type === 'navigation_expression') {
+          // Notification.Name.staticProp or NSNotification.Name.x
+          const rawName = nameNode.text;
+          channelName = rawName;
+          if (channelName.startsWith('Notification.Name.')) channelName = channelName.substring('Notification.Name.'.length);
+          if (channelName.startsWith('NSNotification.Name.')) channelName = channelName.substring('NSNotification.Name.'.length);
+        } else {
+          // Fallback: use raw text
+          channelName = nameNode.text;
+          if (channelName.startsWith('.')) channelName = channelName.substring(1);
+        }
+
+        if (channelName) {
+          const isProducer = !!captureMap['channel.producer.swift'];
+          const anchorNode = captureMap['channel.producer.swift'] ?? captureMap['channel.consumer.swift'];
+          const enclosingId = findEnclosingFunctionId(anchorNode, file.path, provider) ?? generateId('File', file.path);
+          result.channels.push({
+            filePath: file.path, channelName, role: isProducer ? 'producer' : 'consumer',
+            transport: 'swift-notification-center', enclosingSymbolId: enclosingId,
+            lineNumber: anchorNode.startPosition.row,
+          });
         }
         continue;
       }
@@ -1313,6 +2373,8 @@ const processFileGroup = (
               }
             }
 
+            // Check if call is inside an await expression
+            const isAwaited = callNode.parent?.type === 'await_expression';
             result.calls.push({
               filePath: file.path,
               calledName,
@@ -1322,6 +2384,7 @@ const processFileGroup = (
               ...(receiverName !== undefined ? { receiverName } : {}),
               ...(receiverTypeName !== undefined ? { receiverTypeName } : {}),
               ...(receiverMixedChain !== undefined ? { receiverMixedChain } : {}),
+              ...(isAwaited ? { isAwaited: true } : {}),
             });
           }
         }
@@ -1472,10 +2535,30 @@ const processFileGroup = (
             astFrameworkMultiplier: frameworkHint.entryPointMultiplier,
             astFrameworkReason: frameworkHint.reason,
           } : {}),
-          ...(description !== undefined ? { description } : {}),
-          ...(parameterCount !== undefined ? { parameterCount } : {}),
+           ...(description !== undefined ? { description } : {}),
+           ...((nodeLabel === 'Class' || nodeLabel === 'Struct' || nodeLabel === 'Interface' || nodeLabel === 'Enum' || nodeLabel === 'Record')
+              && language === SupportedLanguages.CSharp
+              ? (() => { const ns = findEnclosingNamespace(definitionNode || nameNode); return ns ? { namespace: ns } : {}; })()
+              : {}),
+           ...(parameterCount !== undefined ? { parameterCount } : {}),
           ...(requiredParameterCount !== undefined ? { requiredParameterCount } : {}),
           ...(parameterTypes !== undefined ? { parameterTypes } : {}),
+           ...(returnType !== undefined ? { returnType } : {}),
+           ...((nodeLabel === 'Function' || nodeLabel === 'Method' || nodeLabel === 'Constructor') && definitionNode
+              ? (() => {
+                  // Detect async: TS/JS async_function_declaration, async_arrow_function, etc.
+                  let isAsync = definitionNode.type?.includes('async') ?? false;
+                  // C# async modifier on method_declaration
+                  if (!isAsync && language === SupportedLanguages.CSharp) {
+                    for (let mi = 0; mi < definitionNode.childCount; mi++) {
+                      const ch = definitionNode.child(mi);
+                      if (ch?.type === 'modifier' && ch.text === 'async') { isAsync = true; break; }
+                      if (ch?.type !== 'modifier' && ch?.isNamed) break;
+                    }
+                  }
+                  return isAsync ? { isAsync: true } : {};
+                })()
+              : {}),
           ...(returnType !== undefined ? { returnType } : {}),
           ...(declaredType !== undefined ? { declaredType } : {}),
           ...(visibility !== undefined ? { visibility } : {}),
@@ -1528,6 +2611,67 @@ const processFileGroup = (
           reason: '',
         });
       }
+
+      // Detect C# override methods — collect for post-parse override resolution
+      if (language === SupportedLanguages.CSharp && enclosingClassId
+          && (nodeLabel === 'Method' || nodeLabel === 'Constructor' || nodeLabel === 'Property')
+          && definitionNode) {
+        let isStatic = false;
+        let isOverride = false;
+        // Check modifiers
+        for (let i = 0; i < definitionNode.childCount; i++) {
+          const child = definitionNode.child(i);
+          if (child?.type === 'modifier') {
+            if (child.text === 'override') isOverride = true;
+            if (child.text === 'static') isStatic = true;
+          } else if (child?.isNamed) break; // Past modifiers
+        }
+
+        if (isOverride) {
+          result.overrides.push({
+            filePath: file.path,
+            methodName: nodeName,
+            methodNodeId: nodeId,
+            enclosingClassId,
+          });
+        }
+
+        // Detect C# extension methods — static method with `this` modifier on first parameter
+        if (isStatic && nodeLabel === 'Method') {
+          const paramList = definitionNode.childForFieldName?.('parameters')
+            ?? definitionNode.children?.find((c: any) => c.type === 'parameter_list');
+          if (paramList) {
+            const firstParam = paramList.namedChildren?.[0];
+            if (firstParam?.type === 'parameter') {
+              const firstChild = firstParam.child(0);
+              if (firstChild?.type === 'modifier' && firstChild.text === 'this') {
+                // Extract the extended type name
+                const typeNode = firstParam.childForFieldName?.('type');
+                if (typeNode) {
+                  // Handle: identifier, predefined_type, generic_name, array_type, nullable_type
+                  let typeName: string | null = null;
+                  if (typeNode.type === 'identifier') {
+                    typeName = typeNode.text;
+                  } else if (typeNode.type === 'generic_name') {
+                    // Extract base identifier from generic: IEnumerable<T> → IEnumerable
+                    const baseId = typeNode.children?.find((c: any) => c.type === 'identifier');
+                    typeName = baseId?.text ?? null;
+                  }
+                  // Skip predefined_type (string, int, etc.) — no graph node to link to
+                  if (typeName && typeNode.type !== 'predefined_type') {
+                    result.extensionMethods.push({
+                      filePath: file.path,
+                      methodName: nodeName,
+                      methodNodeId: nodeId,
+                      extendedTypeName: typeName,
+                    });
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
     }
 
     // Extract framework routes via provider detection (e.g., Laravel routes.php)
@@ -1536,6 +2680,228 @@ const processFileGroup = (
       result.routes.push(...extractedRoutes);
     }
 
+    // ── N2: Emit wrapper detection — data-flow through function parameters ──
+    // Detect functions in this file that call *.emit(param) where param is a function
+    // parameter. At call sites where the wrapper is called with a const, create a channel.
+    if ((language === SupportedLanguages.JavaScript || language === SupportedLanguages.TypeScript)
+        && constValueMap.size > 0) {
+      interface EmitWrapperInfo { paramIndex: number; suffix?: string; role?: 'producer' | 'consumer'; }
+
+      const emitWrappers = new Map<string, EmitWrapperInfo[]>(); // funcName → [{ paramIndex, suffix?, role? }]
+
+      /** Resolve a suffix value from a node (string literal, member expression, or identifier) */
+      const resolveSuffixNode = (node: any): string | undefined => {
+        if (!node) return undefined;
+        if (node.type === 'string') return node.namedChildren?.find((c: any) => c.type === 'string_fragment')?.text;
+        if (node.type === 'member_expression') {
+          const sObj = node.childForFieldName?.('object')?.text;
+          const sProp = node.childForFieldName?.('property')?.text;
+          if (sObj && sProp) {
+            const resolved = objectValueMap.get(sObj)?.get(sProp);
+            if (resolved) return resolved;
+            // Fallback: common suffix naming convention
+            if (sProp === 'REQUEST' || sProp === 'RESPONSE' || sProp === 'FAILED')
+              return sProp.charAt(0) + sProp.slice(1).toLowerCase();
+          }
+        }
+        if (node.type === 'identifier') return constValueMap.get(node.text);
+        return undefined;
+      };
+
+      const findEmitInBody = (bodyNode: any, paramNames: string[]): EmitWrapperInfo[] => {
+        // First pass: collect local var → param mappings (single-hop)
+        const localVarToParam = new Map<string, { paramIdx: number; suffix?: string }>();
+        const stack1 = [bodyNode];
+        while (stack1.length > 0) {
+          const nd = stack1.pop();
+          if (!nd) continue;
+          if (nd.type === 'variable_declarator') {
+            const varName = nd.childForFieldName?.('name')?.text;
+            const val = nd.childForFieldName?.('value');
+            if (varName && val) {
+              if (val.type === 'binary_expression') {
+                const left = val.childForFieldName?.('left');
+                const right = val.childForFieldName?.('right');
+                if (left?.type === 'identifier') {
+                  const pIdx = paramNames.indexOf(left.text);
+                  if (pIdx >= 0) {
+                    const suffix = resolveSuffixNode(right);
+                    if (suffix) localVarToParam.set(varName, { paramIdx: pIdx, suffix });
+                  }
+                }
+              }
+              if (val.type === 'call_expression') {
+                const callArgs = val.childForFieldName?.('arguments')?.namedChildren ?? [];
+                if (callArgs[0]?.type === 'identifier') {
+                  const pIdx = paramNames.indexOf(callArgs[0].text);
+                  if (pIdx >= 0) {
+                    const suffix = resolveSuffixNode(callArgs[1]);
+                    if (suffix) localVarToParam.set(varName, { paramIdx: pIdx, suffix });
+                  }
+                }
+              }
+            }
+          }
+          for (let ci = 0; ci < (nd.childCount ?? 0); ci++) stack1.push(nd.child(ci));
+        }
+
+        // Multi-hop: resolve locals derived from other already-resolved locals
+        // e.g., event = getEvent(eventName, ...) [hop 1], requestEvent = event + 'Request' [hop 2]
+        let changed = true;
+        let passes = 0;
+        while (changed && passes < 3) {
+          changed = false;
+          passes++;
+          const stack1b = [bodyNode];
+          while (stack1b.length > 0) {
+            const nd = stack1b.pop();
+            if (!nd) continue;
+            if (nd.type === 'variable_declarator') {
+              const varName = nd.childForFieldName?.('name')?.text;
+              const val = nd.childForFieldName?.('value');
+              if (varName && val && !localVarToParam.has(varName)) {
+                if (val.type === 'binary_expression') {
+                  const left = val.childForFieldName?.('left');
+                  const right = val.childForFieldName?.('right');
+                  if (left?.type === 'identifier') {
+                    const resolved = localVarToParam.get(left.text);
+                    if (resolved) {
+                      const suffix = resolveSuffixNode(right);
+                      if (suffix) {
+                        // Hop 2+: replace suffix (getEvent strips, then hop re-appends)
+                        localVarToParam.set(varName, { paramIdx: resolved.paramIdx, suffix });
+                        changed = true;
+                      }
+                    }
+                  }
+                }
+                if (val.type === 'call_expression') {
+                  const callArgs = val.childForFieldName?.('arguments')?.namedChildren ?? [];
+                  if (callArgs[0]?.type === 'identifier') {
+                    const resolved = localVarToParam.get(callArgs[0].text);
+                    if (resolved) {
+                      const suffix = resolveSuffixNode(callArgs[1]);
+                      if (suffix) {
+                        localVarToParam.set(varName, { paramIdx: resolved.paramIdx, suffix });
+                        changed = true;
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            for (let ci = 0; ci < (nd.childCount ?? 0); ci++) stack1b.push(nd.child(ci));
+          }
+        }
+
+        // Second pass: find socket.emit/once/on(firstArg, ...) — ALL channel references
+        const results: EmitWrapperInfo[] = [];
+        const stack2 = [bodyNode];
+        while (stack2.length > 0) {
+          const nd = stack2.pop();
+          if (!nd) continue;
+          if (nd.type === 'call_expression') {
+            const fn = nd.childForFieldName?.('function');
+            if (fn?.type === 'member_expression') {
+              const methodName = fn.childForFieldName?.('property')?.text;
+              if (methodName === 'emit' || methodName === 'once' || methodName === 'on') {
+                const args = nd.childForFieldName?.('arguments');
+                const firstArg = args?.namedChildren?.[0];
+                if (firstArg?.type === 'identifier') {
+                  const role = methodName === 'emit' ? 'producer' as const : 'consumer' as const;
+                  const directIdx = paramNames.indexOf(firstArg.text);
+                  if (directIdx >= 0) {
+                    results.push({ paramIndex: directIdx, role });
+                  } else {
+                    const indirect = localVarToParam.get(firstArg.text);
+                    if (indirect) {
+                      results.push({ paramIndex: indirect.paramIdx, suffix: indirect.suffix, role });
+                    }
+                  }
+                }
+              }
+            }
+          }
+          for (let ci = 0; ci < (nd.childCount ?? 0); ci++) stack2.push(nd.child(ci));
+        }
+        return results;
+      };
+
+      // Phase 1: Find emit wrappers among function/method definitions
+      for (const m of matches) {
+        const cm: Record<string, any> = {};
+        for (const c of m.captures) cm[c.name] = c.node;
+        const defNode = cm['definition.function'] ?? cm['definition.method'] ?? cm['definition.property'];
+        if (!defNode) continue;
+        const fName = cm['name']?.text;
+        if (!fName) continue;
+        let pList = defNode.childForFieldName?.('parameters')
+          ?? defNode.children?.find((c: any) => c.type === 'formal_parameters' || c.type === 'parameter_list');
+        if (!pList) {
+          // For arrow function class fields: myEmitter = async (id, event, data) => { ... }
+          // defNode is field_definition → value is arrow_function → has parameters + body
+          const arrowFn = defNode.namedChildren?.find((c: any) => c.type === 'arrow_function' || c.type === 'function_expression');
+          if (arrowFn) {
+            pList = arrowFn.childForFieldName?.('parameters')
+              ?? arrowFn.children?.find((c: any) => c.type === 'formal_parameters');
+          }
+        }
+        if (!pList) continue;
+        const pNames: string[] = [];
+        for (const p of pList.namedChildren ?? []) {
+          const n = p.type === 'identifier' ? p : p.childForFieldName?.('pattern') ?? p.childForFieldName?.('name');
+          if (n?.type === 'identifier') pNames.push(n.text);
+        }
+        if (pNames.length === 0) continue;
+        let body = defNode.childForFieldName?.('body');
+        if (!body) {
+          // Arrow function class fields: body is on the arrow function child
+          const arrowFn = defNode.namedChildren?.find((c: any) => c.type === 'arrow_function' || c.type === 'function_expression');
+          body = arrowFn?.childForFieldName?.('body');
+        }
+        if (!body) continue;
+        const emitInfos = findEmitInBody(body, pNames);
+        if (emitInfos.length > 0) emitWrappers.set(fName, emitInfos);
+      }
+
+      // Phase 2: At call sites with const args → create channel edges for each wrapper result
+      if (emitWrappers.size > 0) {
+        for (const m of matches) {
+          const cm: Record<string, any> = {};
+          for (const c of m.captures) cm[c.name] = c.node;
+          if (!cm['call'] || !cm['call.name']) continue;
+          const calledName = cm['call.name'].text;
+          const wrapperInfos = emitWrappers.get(calledName);
+          if (!wrapperInfos) continue;
+
+          const callNode = cm['call'];
+          const argsNode = callNode.childForFieldName?.('arguments');
+          if (!argsNode) continue;
+
+          // For each channel the wrapper emits/listens, resolve the const arg and apply suffix
+          for (const wi of wrapperInfos) {
+            const eventArg = (argsNode.namedChildren ?? [])[wi.paramIndex];
+            if (!eventArg) continue;
+            let baseChName: string | undefined;
+            if (eventArg.type === 'identifier') baseChName = constValueMap.get(eventArg.text);
+            else if (eventArg.type === 'string') {
+              const frag = eventArg.namedChildren?.find((c: any) => c.type === 'string_fragment');
+              baseChName = frag?.text;
+            }
+            if (baseChName && baseChName !== 'connect' && baseChName !== 'disconnect' && baseChName !== 'error') {
+              const encId = findEnclosingFunctionId(callNode, file.path, provider) ?? generateId('File', file.path);
+              const chName = wi.suffix ? baseChName + wi.suffix : baseChName;
+              result.channels.push({
+                filePath: file.path, channelName: chName,
+                role: wi.role ?? 'producer',
+                transport: 'socket.io', enclosingSymbolId: encId,
+                lineNumber: callNode.startPosition.row,
+              });
+            }
+          }
+        }
+      }
+    }
     // Extract ORM queries (Prisma, Supabase)
     extractORMQueries(file.path, file.content, result.ormQueries);
   }
@@ -1548,7 +2914,7 @@ const processFileGroup = (
 /** Accumulated result across sub-batches */
 let accumulated: ParseWorkerResult = {
   nodes: [], relationships: [], symbols: [],
-  imports: [], calls: [], assignments: [], heritage: [], routes: [], fetchCalls: [], decoratorRoutes: [], toolDefs: [], ormQueries: [], constructorBindings: [], typeEnvBindings: [], skippedLanguages: {}, fileCount: 0,
+  imports: [], calls: [], assignments: [], heritage: [], routes: [], fetchCalls: [], decoratorRoutes: [], toolDefs: [], channels: [], eventRefs: [], overrides: [], extensionMethods: [], contextRefs: [], constValues: [], ormQueries: [], constructorBindings: [], typeEnvBindings: [], skippedLanguages: {}, fileCount: 0,
 };
 let cumulativeProcessed = 0;
 
@@ -1564,6 +2930,12 @@ const mergeResult = (target: ParseWorkerResult, src: ParseWorkerResult) => {
   target.fetchCalls.push(...src.fetchCalls);
   target.decoratorRoutes.push(...src.decoratorRoutes);
   target.toolDefs.push(...src.toolDefs);
+  target.channels.push(...src.channels);
+  target.eventRefs.push(...src.eventRefs);
+  target.overrides.push(...src.overrides);
+  target.extensionMethods.push(...src.extensionMethods);
+  target.contextRefs.push(...src.contextRefs);
+  target.constValues.push(...src.constValues);
   target.ormQueries.push(...src.ormQueries);
   target.constructorBindings.push(...src.constructorBindings);
   target.typeEnvBindings.push(...src.typeEnvBindings);
@@ -1591,7 +2963,7 @@ parentPort!.on('message', (msg: any) => {
     if (msg && msg.type === 'flush') {
       parentPort!.postMessage({ type: 'result', data: accumulated });
       // Reset for potential reuse
-      accumulated = { nodes: [], relationships: [], symbols: [], imports: [], calls: [], assignments: [], heritage: [], routes: [], fetchCalls: [], decoratorRoutes: [], toolDefs: [], ormQueries: [], constructorBindings: [], typeEnvBindings: [], skippedLanguages: {}, fileCount: 0 };
+      accumulated = { nodes: [], relationships: [], symbols: [], imports: [], calls: [], assignments: [], heritage: [], routes: [], fetchCalls: [], decoratorRoutes: [], toolDefs: [], channels: [], eventRefs: [], overrides: [], extensionMethods: [], contextRefs: [], constValues: [], ormQueries: [], constructorBindings: [], typeEnvBindings: [], skippedLanguages: {}, fileCount: 0 };
       cumulativeProcessed = 0;
       return;
     }

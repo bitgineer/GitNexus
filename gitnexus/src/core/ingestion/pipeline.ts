@@ -16,7 +16,10 @@ import { phpFileToRouteURL } from './route-extractors/php.js';
 import { extractResponseShapes, extractPHPResponseShapes } from './route-extractors/response-shapes.js';
 import { extractMiddlewareChain, extractNextjsMiddlewareConfig, compileMatcher, compiledMatcherMatchesRoute } from './route-extractors/middleware.js';
 import { generateId } from '../../lib/utils.js';
-import type { ExtractedFetchCall, ExtractedRoute, ExtractedDecoratorRoute, ExtractedToolDef, ExtractedORMQuery } from './workers/parse-worker.js';
+import type { ExtractedFetchCall, ExtractedRoute, ExtractedDecoratorRoute, ExtractedToolDef, ExtractedChannel, ExtractedEventRef, ExtractedOverride, ExtractedExtensionMethod, ExtractedContextRef, FileConstValues, ExtractedORMQuery } from './workers/parse-worker.js';
+import { resolveChannels, resolveConstChannelNames, resolveEvents, resolveContexts } from './channel-resolver.js';
+import { unifyPartialClasses } from './partial-class-processor.js';
+import { processOverrides } from './override-processor.js';
 import { processHeritage, processHeritageFromExtracted } from './heritage-processor.js';
 import { computeMRO } from './mro-processor.js';
 import { processCommunities } from './community-processor.js';
@@ -543,13 +546,22 @@ async function runChunkedParseAndResolve(
   allExtractedRoutes: ExtractedRoute[];
   allDecoratorRoutes: ExtractedDecoratorRoute[];
   allToolDefs: ExtractedToolDef[];
+  allChannels: ExtractedChannel[];
+  allEventRefs: ExtractedEventRef[];
+  allOverrides: ExtractedOverride[];
+  allExtensionMethods: ExtractedExtensionMethod[];
+  allContextRefs: ExtractedContextRef[];
+  allConstValues: FileConstValues[];
   allORMQueries: ExtractedORMQuery[];
 }> {
   const symbolTable = ctx.symbols;
 
   const parseableScanned = scannedFiles.filter(f => {
     const lang = getLanguageFromFilename(f.path);
-    return lang && isLanguageAvailable(lang);
+    if (lang && isLanguageAvailable(lang)) return true;
+    // Include SCSS/CSS files for regex-based class extraction
+    if (f.path.endsWith('.scss') || f.path.endsWith('.css')) return true;
+    return false;
   });
 
   // Warn about files skipped due to unavailable parsers
@@ -664,6 +676,13 @@ async function runChunkedParseAndResolve(
   const allDecoratorRoutes: ExtractedDecoratorRoute[] = [];
   // Accumulate MCP/RPC tool definitions (@mcp.tool(), @app.tool(), etc.)
   const allToolDefs: ExtractedToolDef[] = [];
+  // Accumulate message channel references (Electron IPC, Socket.IO, EventEmitter, etc.)
+  const allChannels: ExtractedChannel[] = [];
+  const allEventRefs: ExtractedEventRef[] = [];
+  const allOverrides: ExtractedOverride[] = [];
+  const allExtensionMethods: ExtractedExtensionMethod[] = [];
+  const allContextRefs: ExtractedContextRef[] = [];
+  const allConstValues: FileConstValues[] = [];
     const allORMQueries: ExtractedORMQuery[] = [];
 
   try {
@@ -793,6 +812,24 @@ async function runChunkedParseAndResolve(
         if (chunkWorkerData.toolDefs?.length) {
           allToolDefs.push(...chunkWorkerData.toolDefs);
         }
+        if (chunkWorkerData.channels?.length) {
+          allChannels.push(...chunkWorkerData.channels);
+        }
+        if (chunkWorkerData.eventRefs?.length) {
+          allEventRefs.push(...chunkWorkerData.eventRefs);
+        }
+        if (chunkWorkerData.overrides?.length) {
+          allOverrides.push(...chunkWorkerData.overrides);
+        }
+        if (chunkWorkerData.extensionMethods?.length) {
+          allExtensionMethods.push(...chunkWorkerData.extensionMethods);
+        }
+        if (chunkWorkerData.contextRefs?.length) {
+          allContextRefs.push(...chunkWorkerData.contextRefs);
+        }
+        if (chunkWorkerData.constValues?.length) {
+          allConstValues.push(...chunkWorkerData.constValues);
+        }
         if (chunkWorkerData.ormQueries?.length) {
           allORMQueries.push(...chunkWorkerData.ormQueries);
         }
@@ -891,7 +928,7 @@ async function runChunkedParseAndResolve(
   importCtx.index = EMPTY_INDEX; // Release suffix index memory (~30MB for large repos)
   importCtx.normalizedFileList = [];
 
-  return { exportedTypeMap, allFetchCalls, allExtractedRoutes, allDecoratorRoutes, allToolDefs, allORMQueries };
+  return { exportedTypeMap, allFetchCalls, allExtractedRoutes, allDecoratorRoutes, allToolDefs, allChannels, allEventRefs, allOverrides, allExtensionMethods, allContextRefs, allConstValues, allORMQueries };
 }
 
 /**
@@ -1113,7 +1150,7 @@ export const runPipelineFromRepo = async (
     const { scannedFiles, allPaths, totalFiles } = await runScanAndStructure(repoPath, graph, onProgress);
 
     // Phase 3+4: Chunked parse + resolve (imports, calls, heritage, routes)
-    const { exportedTypeMap, allFetchCalls, allExtractedRoutes, allDecoratorRoutes, allToolDefs, allORMQueries } = await runChunkedParseAndResolve(
+    const { exportedTypeMap, allFetchCalls, allExtractedRoutes, allDecoratorRoutes, allToolDefs, allChannels, allEventRefs, allOverrides, allExtensionMethods, allContextRefs, allConstValues, allORMQueries } = await runChunkedParseAndResolve(
       graph, ctx, scannedFiles, allPaths, totalFiles, repoPath, pipelineStart, onProgress,
     );
 
@@ -1321,6 +1358,82 @@ export const runPipelineFromRepo = async (
       }
     }
 
+    // ── Phase 3.5d: Partial Class Unification (C#) ────────────────────────
+    {
+      const partialStats = unifyPartialClasses(graph);
+      if (partialStats.groupsFound > 0 && (isDev || !!process.env.GITNEXUS_VERBOSE)) {
+        console.log(`🔗 Partial class unification: ${partialStats.groupsFound} groups, ${partialStats.nodesRemoved} duplicate nodes removed, ${partialStats.edgesRepointed} edges re-pointed`);
+      }
+    }
+
+    // ── Phase 3.5e: Channel & Event Registry (IPC, Socket.IO, EventEmitter, C# events) ──
+    if (allChannels.length > 0) {
+      // Cross-file const resolution: resolve variable channel names using constValues from other files
+      if (allConstValues.length > 0) {
+        const resolved = resolveConstChannelNames(allChannels, allConstValues, ctx.importMap);
+        if (resolved > 0 && (isDev || !!process.env.GITNEXUS_VERBOSE)) {
+          console.log(`🔌 Const resolver: ${resolved} variable channel names resolved to string literals`);
+        }
+      }
+      const channelStats = resolveChannels(graph, allChannels);
+      if (channelStats.edgesCreated > 0 && (isDev || !!process.env.GITNEXUS_VERBOSE)) {
+        const transportSummary = Object.entries(channelStats.byTransport)
+          .map(([t, c]) => `${t}: ${c}`)
+          .join(', ');
+        console.log(`🔌 Channel resolver: ${channelStats.matchedChannels}/${channelStats.totalChannels} channels matched, ${channelStats.edgesCreated} edges created (${transportSummary})`);
+      }
+    }
+
+    // C# event fire→subscriber resolution
+    if (allEventRefs.length > 0) {
+      const eventStats = resolveEvents(graph, allEventRefs);
+      if (eventStats.edgesCreated > 0 && (isDev || !!process.env.GITNEXUS_VERBOSE)) {
+        console.log(`🔌 Event resolver: ${eventStats.matchedEvents}/${eventStats.totalEvents} events matched, ${eventStats.edgesCreated} edges created`);
+      }
+    }
+
+    // ── Phase 3.5f: React Context Resolution (Provider → Consumer) ────
+    if (allContextRefs.length > 0) {
+      const ctxStats = resolveContexts(graph, allContextRefs);
+      if (ctxStats.edgesCreated > 0 && (isDev || !!process.env.GITNEXUS_VERBOSE)) {
+        console.log(`🔌 Context resolver: ${ctxStats.matchedContexts}/${ctxStats.totalContexts} contexts matched, ${ctxStats.edgesCreated} Provider→Consumer edges`);
+      }
+    }
+
+    // ── Phase 3.5g: Override Resolution (C#) ──────────────────────────
+    if (allOverrides.length > 0) {
+      const overrideStats = processOverrides(graph, allOverrides);
+      if (overrideStats.edgesCreated > 0 && (isDev || !!process.env.GITNEXUS_VERBOSE)) {
+        console.log(`🔗 Override resolver: ${overrideStats.resolved}/${overrideStats.totalOverrides} resolved, ${overrideStats.edgesCreated} OVERRIDES edges (${overrideStats.syntheticNodesCreated} synthetic .NET nodes, ${overrideStats.unresolved} unresolved)`);
+      }
+    }
+
+    // ── Phase 3.5g: Extension Method Linking (C#) ─────────────────────
+    if (allExtensionMethods.length > 0) {
+      let linked = 0;
+      for (const ext of allExtensionMethods) {
+        // Resolve extended type name to a graph node
+        const resolved = ctx.resolve(ext.extendedTypeName, ext.filePath);
+        if (resolved && resolved.candidates.length > 0) {
+          const targetNode = resolved.candidates[0];
+          if (targetNode.type === 'Class' || targetNode.type === 'Interface' || targetNode.type === 'Struct' || targetNode.type === 'Record') {
+            graph.addRelationship({
+              id: generateId('HAS_METHOD', `${targetNode.nodeId}->${ext.methodNodeId}`),
+              sourceId: targetNode.nodeId,
+              targetId: ext.methodNodeId,
+              type: 'HAS_METHOD',
+              confidence: 0.9,
+              reason: 'extension-method',
+            });
+            linked++;
+          }
+        }
+      }
+      if (linked > 0 && (isDev || !!process.env.GITNEXUS_VERBOSE)) {
+        console.log(`🔗 Extension methods: ${linked}/${allExtensionMethods.length} linked to extended types`);
+      }
+    }
+
     // ── Phase 3.6: Tool Detection (MCP/RPC) ──────────────────────────
     const toolDefs: { name: string; filePath: string; description: string }[] = [];
     const seenToolNames = new Set<string>();
@@ -1411,7 +1524,7 @@ export const runPipelineFromRepo = async (
       },
     });
 
-    return { graph, repoPath, totalFileCount: totalFiles, communityResult, processResult };
+    return { graph, repoPath, totalFileCount: totalFiles, communityResult, processResult, allChannels };
   } catch (error) {
     ctx.clear();
     throw error;

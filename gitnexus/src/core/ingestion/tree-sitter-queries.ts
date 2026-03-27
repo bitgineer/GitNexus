@@ -15,6 +15,12 @@ export const TYPESCRIPT_QUERIES = `
 (interface_declaration
   name: (type_identifier) @name) @definition.interface
 
+(enum_declaration
+  name: (identifier) @name) @definition.enum
+
+(type_alias_declaration
+  name: (type_identifier) @name) @definition.type
+
 (function_declaration
   name: (identifier) @name) @definition.function
 
@@ -92,6 +98,12 @@ export const TYPESCRIPT_QUERIES = `
     (implements_clause
       (type_identifier) @heritage.implements))) @heritage.impl
 
+; Heritage queries - interface extends interface
+(interface_declaration
+  name: (type_identifier) @heritage.class
+  (extends_type_clause
+    type: (type_identifier) @heritage.extends)) @heritage
+
 ; Write access: obj.field = value
 (assignment_expression
   left: (member_expression
@@ -133,6 +145,210 @@ export const TYPESCRIPT_QUERIES = `
     property: (property_identifier) @express_route.method)
   arguments: (arguments
     (string (string_fragment) @express_route.path))) @express_route
+
+; ── React Context captures (Provider → Consumer data flow) ────────────────
+
+; useContext consumer: useContext(ContextName) — component consumes context data
+(call_expression
+  function: (identifier) @_uc (#eq? @_uc "useContext")
+  arguments: (arguments
+    .
+    (identifier) @context.consumed)) @context.consumer
+
+; ── Message channel captures (Electron IPC, Socket.IO, EventEmitter) ──────
+
+; Electron IPC consumer: ipcMain.handle('channel', fn), ipcMain.on('channel', fn)
+(call_expression
+  function: (member_expression
+    object: (identifier) @_ipc_obj (#eq? @_ipc_obj "ipcMain")
+    property: (property_identifier) @channel.method)
+  arguments: (arguments
+    (string (string_fragment) @channel.name))) @channel.consumer
+
+; Electron IPC producer: ipcRenderer.invoke('channel'), ipcRenderer.send('channel'), ipcRenderer.sendSync('channel')
+(call_expression
+  function: (member_expression
+    object: (identifier) @_ipc_obj2 (#eq? @_ipc_obj2 "ipcRenderer")
+    property: (property_identifier) @channel.method)
+  arguments: (arguments
+    (string (string_fragment) @channel.name))) @channel.producer
+
+; Electron IPC event listener: ipcRenderer.on('channel', fn) — receives push from main process
+(call_expression
+  function: (member_expression
+    object: (identifier) @_ipc_obj3 (#eq? @_ipc_obj3 "ipcRenderer")
+    property: (property_identifier) @_on_method (#eq? @_on_method "on"))
+  arguments: (arguments
+    (string (string_fragment) @channel.name))) @channel.consumer
+
+; Electron IPC push: webContents.send('channel') — main pushes to renderer
+(call_expression
+  function: (member_expression
+    property: (property_identifier) @_send_method (#eq? @_send_method "send"))
+  arguments: (arguments
+    (string (string_fragment) @channel.name))) @channel.producer.webcontents
+
+; Socket.IO server/client listener: socket.on('event', fn), io.on('event', fn)
+(call_expression
+  function: (member_expression
+    object: (identifier) @channel.object
+    property: (property_identifier) @_on_method2 (#match? @_on_method2 "^(on|once)$"))
+  arguments: (arguments
+    (string (string_fragment) @channel.name))) @channel.consumer.socket
+
+; Socket.IO/EventEmitter listener via this: this.socket.on('event', fn), this.emitter.on('event', fn)
+(call_expression
+  function: (member_expression
+    object: (member_expression
+      object: (this)
+      property: (property_identifier) @channel.object)
+    property: (property_identifier) @_on_method3 (#match? @_on_method3 "^(on|once)$"))
+  arguments: (arguments
+    (string (string_fragment) @channel.name))) @channel.consumer.socket
+
+; Socket.IO emit: socket.emit('event', data), io.emit('event', data)
+(call_expression
+  function: (member_expression
+    object: (identifier) @channel.object
+    property: (property_identifier) @_emit_method (#match? @_emit_method "^emit$"))
+  arguments: (arguments
+    (string (string_fragment) @channel.name))) @channel.producer.socket
+
+; Socket.IO/EventEmitter emit via this: this.socket.emit('event', data), this.emitter.emit('event', data)
+(call_expression
+  function: (member_expression
+    object: (member_expression
+      object: (this)
+      property: (property_identifier) @channel.object)
+    property: (property_identifier) @_emit_method2 (#match? @_emit_method2 "^emit$"))
+  arguments: (arguments
+    (string (string_fragment) @channel.name))) @channel.producer.socket
+
+; ── Variable channel name captures (const/identifier first arg) ───────────
+
+; socket.on(VARIABLE, fn) — identifier as first arg (const variable)
+(call_expression
+  function: (member_expression
+    object: (identifier) @channel.object
+    property: (property_identifier) @_on_var (#match? @_on_var "^(on|once)$"))
+  arguments: (arguments
+    .
+    (identifier) @channel.name.var)) @channel.consumer.socket.var
+
+; this.socket.on(VARIABLE, fn) — via this
+(call_expression
+  function: (member_expression
+    object: (member_expression
+      object: (this)
+      property: (property_identifier) @channel.object)
+    property: (property_identifier) @_on_var2 (#match? @_on_var2 "^(on|once)$"))
+  arguments: (arguments
+    .
+    (identifier) @channel.name.var)) @channel.consumer.socket.var
+
+; socket.emit(VARIABLE, data) — identifier as first arg
+(call_expression
+  function: (member_expression
+    object: (identifier) @channel.object
+    property: (property_identifier) @_emit_var (#match? @_emit_var "^emit$"))
+  arguments: (arguments
+    .
+    (identifier) @channel.name.var)) @channel.producer.socket.var
+
+; this.socket.emit(VARIABLE, data) — via this
+(call_expression
+  function: (member_expression
+    object: (member_expression
+      object: (this)
+      property: (property_identifier) @channel.object)
+    property: (property_identifier) @_emit_var2 (#match? @_emit_var2 "^emit$"))
+  arguments: (arguments
+    .
+    (identifier) @channel.name.var)) @channel.producer.socket.var
+
+; socket.on(OBJ.PROP, fn) — member expression as first arg (object property lookup)
+(call_expression
+  function: (member_expression
+    object: (identifier) @channel.object
+    property: (property_identifier) @_on_member (#match? @_on_member "^(on|once)$"))
+  arguments: (arguments
+    .
+    (member_expression
+      object: (identifier) @channel.ref.obj
+      property: (property_identifier) @channel.ref.prop))) @channel.consumer.socket.member
+
+; socket.emit(OBJ.PROP, data) — member expression as first arg
+(call_expression
+  function: (member_expression
+    object: (identifier) @channel.object
+    property: (property_identifier) @_emit_member (#match? @_emit_member "^emit$"))
+  arguments: (arguments
+    .
+    (member_expression
+      object: (identifier) @channel.ref.obj
+      property: (property_identifier) @channel.ref.prop))) @channel.producer.socket.member
+
+; getIO().on(OBJ.PROP, fn) — chained call as socket object (e.g., getIO().on(...))
+(call_expression
+  function: (member_expression
+    object: (call_expression)
+    property: (property_identifier) @_on_chain (#match? @_on_chain "^(on|once|off)$"))
+  arguments: (arguments
+    .
+    (member_expression
+      object: (identifier) @channel.ref.obj
+      property: (property_identifier) @channel.ref.prop))) @channel.consumer.socket.member
+
+; getIO().emit(OBJ.PROP, data) — chained call emit
+(call_expression
+  function: (member_expression
+    object: (call_expression)
+    property: (property_identifier) @_emit_chain (#match? @_emit_chain "^emit$"))
+  arguments: (arguments
+    .
+    (member_expression
+      object: (identifier) @channel.ref.obj
+      property: (property_identifier) @channel.ref.prop))) @channel.producer.socket.member
+
+; Chained .on(CONST_VAR, handler) — socket.on(...).on(CONST, handler)
+(call_expression
+  function: (member_expression
+    object: (call_expression)
+    property: (property_identifier) @_on_chain_var (#match? @_on_chain_var "^(on|once|off)$"))
+  arguments: (arguments
+    .
+    (identifier) @channel.name.var)) @channel.consumer.socket.var
+
+; Chained .emit(CONST_VAR, data)
+(call_expression
+  function: (member_expression
+    object: (call_expression)
+    property: (property_identifier) @_emit_chain_var (#match? @_emit_chain_var "^emit$"))
+  arguments: (arguments
+    .
+    (identifier) @channel.name.var)) @channel.producer.socket.var
+`;
+
+// Extra JSX-specific queries — appended for .tsx/.jsx files (TSX grammar only)
+export const JSX_EXTRA_QUERIES = `
+; JSX component render: <Component /> — treated as CALLS from parent to component
+(jsx_self_closing_element
+  name: (identifier) @call.name) @call
+
+; JSX component render: <Component>...</Component>
+(jsx_opening_element
+  name: (identifier) @call.name) @call
+
+; JSX member expression: <Foo.Bar />
+(jsx_self_closing_element
+  name: (member_expression
+    property: (property_identifier) @call.name)) @call
+
+; JSX Provider: <Ctx.Provider value={...}> — component provides context data
+(jsx_opening_element
+  name: (member_expression
+    object: (identifier) @context.provider.name
+    property: (property_identifier) @_prov (#eq? @_prov "Provider"))) @context.provider
 `;
 
 // JavaScript queries - works with tree-sitter-javascript
@@ -186,6 +402,19 @@ export const JAVASCRIPT_QUERIES = `
 (new_expression
   constructor: (identifier) @call.name) @call
 
+; JSX component render: <Component /> — treated as CALLS from parent to component
+(jsx_self_closing_element
+  name: (identifier) @call.name) @call
+
+; JSX component render: <Component>...</Component>
+(jsx_opening_element
+  name: (identifier) @call.name) @call
+
+; JSX member expression: <Foo.Bar />
+(jsx_self_closing_element
+  name: (member_expression
+    property: (property_identifier) @call.name)) @call
+
 ; Class fields — field_definition captures JS class fields (class User { address = ... })
 (field_definition
   property: (property_identifier) @name) @definition.property
@@ -231,6 +460,163 @@ export const JAVASCRIPT_QUERIES = `
     property: (property_identifier) @express_route.method)
   arguments: (arguments
     (string (string_fragment) @express_route.path))) @express_route
+
+; ── React Context captures ────────────────────────────────────────────────
+
+; useContext consumer: useContext(ContextName)
+(call_expression
+  function: (identifier) @_uc_js (#eq? @_uc_js "useContext")
+  arguments: (arguments
+    .
+    (identifier) @context.consumed)) @context.consumer
+
+; JSX Provider: <Ctx.Provider value={...}>
+(jsx_opening_element
+  name: (member_expression
+    object: (identifier) @context.provider.name
+    property: (property_identifier) @_prov_js (#eq? @_prov_js "Provider"))) @context.provider
+
+; ── Message channel captures (Socket.IO, EventEmitter) ────────────────────
+
+; Socket.IO / EventEmitter listener: socket.on('event', fn), emitter.on('event', fn)
+(call_expression
+  function: (member_expression
+    object: (identifier) @channel.object
+    property: (property_identifier) @_on_method (#match? @_on_method "^(on|once)$"))
+  arguments: (arguments
+    (string (string_fragment) @channel.name))) @channel.consumer.socket
+
+; Socket.IO/EventEmitter listener via this: this.socket.on('event', fn)
+(call_expression
+  function: (member_expression
+    object: (member_expression
+      object: (this)
+      property: (property_identifier) @channel.object)
+    property: (property_identifier) @_on_method_this (#match? @_on_method_this "^(on|once)$"))
+  arguments: (arguments
+    (string (string_fragment) @channel.name))) @channel.consumer.socket
+
+; Socket.IO / EventEmitter emit: socket.emit('event', data), emitter.emit('event', data)
+(call_expression
+  function: (member_expression
+    object: (identifier) @channel.object
+    property: (property_identifier) @_emit_method (#match? @_emit_method "^emit$"))
+  arguments: (arguments
+    (string (string_fragment) @channel.name))) @channel.producer.socket
+
+; Socket.IO/EventEmitter emit via this: this.socket.emit('event', data)
+(call_expression
+  function: (member_expression
+    object: (member_expression
+      object: (this)
+      property: (property_identifier) @channel.object)
+    property: (property_identifier) @_emit_method_this (#match? @_emit_method_this "^emit$"))
+  arguments: (arguments
+    (string (string_fragment) @channel.name))) @channel.producer.socket
+
+; ── Variable channel name captures (const/identifier first arg) ───────────
+
+; socket.on(VARIABLE, fn) — identifier as first arg (const variable)
+(call_expression
+  function: (member_expression
+    object: (identifier) @channel.object
+    property: (property_identifier) @_on_var_js (#match? @_on_var_js "^(on|once)$"))
+  arguments: (arguments
+    .
+    (identifier) @channel.name.var)) @channel.consumer.socket.var
+
+; this.socket.on(VARIABLE, fn) — via this
+(call_expression
+  function: (member_expression
+    object: (member_expression
+      object: (this)
+      property: (property_identifier) @channel.object)
+    property: (property_identifier) @_on_var2_js (#match? @_on_var2_js "^(on|once)$"))
+  arguments: (arguments
+    .
+    (identifier) @channel.name.var)) @channel.consumer.socket.var
+
+; socket.emit(VARIABLE, data) — identifier as first arg
+(call_expression
+  function: (member_expression
+    object: (identifier) @channel.object
+    property: (property_identifier) @_emit_var_js (#match? @_emit_var_js "^emit$"))
+  arguments: (arguments
+    .
+    (identifier) @channel.name.var)) @channel.producer.socket.var
+
+; this.socket.emit(VARIABLE, data) — via this
+(call_expression
+  function: (member_expression
+    object: (member_expression
+      object: (this)
+      property: (property_identifier) @channel.object)
+    property: (property_identifier) @_emit_var2_js (#match? @_emit_var2_js "^emit$"))
+  arguments: (arguments
+    .
+    (identifier) @channel.name.var)) @channel.producer.socket.var
+
+; socket.on(OBJ.PROP, fn) — member expression as first arg
+(call_expression
+  function: (member_expression
+    object: (identifier) @channel.object
+    property: (property_identifier) @_on_member_js (#match? @_on_member_js "^(on|once)$"))
+  arguments: (arguments
+    .
+    (member_expression
+      object: (identifier) @channel.ref.obj
+      property: (property_identifier) @channel.ref.prop))) @channel.consumer.socket.member
+
+; socket.emit(OBJ.PROP, data) — member expression as first arg
+(call_expression
+  function: (member_expression
+    object: (identifier) @channel.object
+    property: (property_identifier) @_emit_member_js (#match? @_emit_member_js "^emit$"))
+  arguments: (arguments
+    .
+    (member_expression
+      object: (identifier) @channel.ref.obj
+      property: (property_identifier) @channel.ref.prop))) @channel.producer.socket.member
+
+; getIO().on(OBJ.PROP, fn) — chained call as socket object
+(call_expression
+  function: (member_expression
+    object: (call_expression)
+    property: (property_identifier) @_on_chain_js (#match? @_on_chain_js "^(on|once|off)$"))
+  arguments: (arguments
+    .
+    (member_expression
+      object: (identifier) @channel.ref.obj
+      property: (property_identifier) @channel.ref.prop))) @channel.consumer.socket.member
+
+; getIO().emit(OBJ.PROP, data) — chained call emit
+(call_expression
+  function: (member_expression
+    object: (call_expression)
+    property: (property_identifier) @_emit_chain_js (#match? @_emit_chain_js "^emit$"))
+  arguments: (arguments
+    .
+    (member_expression
+      object: (identifier) @channel.ref.obj
+      property: (property_identifier) @channel.ref.prop))) @channel.producer.socket.member
+
+; Chained .on(CONST_VAR, handler) — socket.on(...).on(CONST, handler)
+(call_expression
+  function: (member_expression
+    object: (call_expression)
+    property: (property_identifier) @_on_chain_var_js (#match? @_on_chain_var_js "^(on|once|off)$"))
+  arguments: (arguments
+    .
+    (identifier) @channel.name.var)) @channel.consumer.socket.var
+
+; Chained .emit(CONST_VAR, data)
+(call_expression
+  function: (member_expression
+    object: (call_expression)
+    property: (property_identifier) @_emit_chain_var_js (#match? @_emit_chain_var_js "^emit$"))
+  arguments: (arguments
+    .
+    (identifier) @channel.name.var)) @channel.producer.socket.var
 `;
 
 // Python queries - works with tree-sitter-python
@@ -306,6 +692,108 @@ export const PYTHON_QUERIES = `
       attribute: (identifier) @decorator.name)
     arguments: (argument_list
       (string (string_content) @decorator.arg)?))) @decorator
+
+; ── Message channel captures (Socket.IO, EventEmitter, Celery, Redis) ──────
+
+; Python Socket.IO / EventEmitter producer: obj.emit('event', data)
+(call
+  function: (attribute
+    object: (_) @channel.py.object
+    attribute: (identifier) @_emit_py (#eq? @_emit_py "emit"))
+  arguments: (argument_list
+    (string (string_content) @channel.name))) @channel.producer.py
+
+; Python Socket.IO / EventEmitter consumer: obj.on('event', handler)
+(call
+  function: (attribute
+    object: (_) @channel.py.object
+    attribute: (identifier) @_on_py (#match? @_on_py "^(on|once)$"))
+  arguments: (argument_list
+    (string (string_content) @channel.name))) @channel.consumer.py
+
+; Python decorator listener: @socketio.on('event') or @sio.on('event')
+(decorated_definition
+  (decorator
+    (call
+      function: (attribute
+        object: (identifier) @channel.py.deco.object
+        attribute: (identifier) @_deco_on_py (#eq? @_deco_on_py "on"))
+      arguments: (argument_list
+        (string (string_content) @channel.name))))) @channel.consumer.py.decorator
+
+; Python @sio.event / @socketio.event decorator (event name = function name)
+; NOTE: This captures the decorator so we can detect it, but the channel name
+; is the function name (resolved in parse-worker, not here).
+(decorated_definition
+  (decorator
+    (attribute
+      object: (identifier) @channel.py.event.object
+      attribute: (identifier) @_event_deco (#eq? @_event_deco "event")))
+  definition: (function_definition
+    name: (identifier) @channel.name)) @channel.consumer.py.event
+
+; Celery send_task: app.send_task('dotted.task.name', ...)
+(call
+  function: (attribute
+    attribute: (identifier) @_send_task_py (#eq? @_send_task_py "send_task"))
+  arguments: (argument_list
+    (string (string_content) @channel.name))) @channel.producer.celery
+
+; Celery delay/apply_async via named task: task_name.delay(args) captured as regular call;
+; The cross-reference is via import chain, not string key. We capture send_task only.
+
+; Celery task decorator: @app.task(name='task.name')
+(decorated_definition
+  (decorator
+    (call
+      function: (attribute
+        attribute: (identifier) @_task_deco_py (#eq? @_task_deco_py "task"))
+      arguments: (argument_list
+        (keyword_argument
+          name: (identifier) @_name_kw_py (#eq? @_name_kw_py "name")
+          value: (string (string_content) @channel.name)))))) @channel.consumer.celery
+
+; Celery shared_task decorator: @shared_task(name='task.name')
+(decorated_definition
+  (decorator
+    (call
+      function: (identifier) @_shared_task_py (#eq? @_shared_task_py "shared_task")
+      arguments: (argument_list
+        (keyword_argument
+          name: (identifier) @_name_kw_py2 (#eq? @_name_kw_py2 "name")
+          value: (string (string_content) @channel.name)))))) @channel.consumer.celery
+
+; Redis publish: redis.publish('channel', data)
+(call
+  function: (attribute
+    attribute: (identifier) @_publish_py (#eq? @_publish_py "publish"))
+  arguments: (argument_list
+    (string (string_content) @channel.name))) @channel.producer.redis
+
+; Redis subscribe: pubsub.subscribe('channel') or pubsub.psubscribe('pattern')
+(call
+  function: (attribute
+    attribute: (identifier) @_subscribe_py (#match? @_subscribe_py "^p?subscribe$"))
+  arguments: (argument_list
+    (string (string_content) @channel.name))) @channel.consumer.redis
+
+; Python Socket.IO / EventEmitter with variable: obj.emit(VARIABLE, data)
+(call
+  function: (attribute
+    object: (_) @channel.py.var.object
+    attribute: (identifier) @_emit_var_py (#eq? @_emit_var_py "emit"))
+  arguments: (argument_list
+    .
+    (identifier) @channel.name.var)) @channel.producer.py.var
+
+; Python Socket.IO / EventEmitter consumer with variable: obj.on(VARIABLE, handler)
+(call
+  function: (attribute
+    object: (_) @channel.py.var.object
+    attribute: (identifier) @_on_var_py (#match? @_on_var_py "^(on|once)$"))
+  arguments: (argument_list
+    .
+    (identifier) @channel.name.var)) @channel.consumer.py.var
 `;
 
 // Java queries - works with tree-sitter-java
@@ -349,6 +837,43 @@ export const JAVA_QUERIES = `
     object: (_) @assignment.receiver
     field: (identifier) @assignment.property)
   right: (_)) @assignment
+
+; ── Message channel captures (Kafka, JMS, RabbitMQ) ────────────────────────
+
+; Java method call with string first arg: template.send("topic", msg)
+; Matches kafkaTemplate.send, jmsTemplate.convertAndSend, rabbitTemplate.convertAndSend
+(method_invocation
+  object: (_) @channel.java.object
+  name: (identifier) @channel.java.method
+  arguments: (argument_list
+    (string_literal) @channel.name)) @channel.java
+
+; Java annotation with string attribute value:
+; @KafkaListener(topics = "topic"), @JmsListener(destination = "dest"), @RabbitListener(queues = "queue")
+(annotation
+  name: (identifier) @channel.java.annotation.name
+  arguments: (annotation_argument_list
+    (element_value_pair
+      key: (identifier) @channel.java.annotation.key
+      value: (string_literal) @channel.name))) @channel.java.annotation
+
+; Java annotation with string array attribute:
+; @KafkaListener(topics = {"topic1", "topic2"})
+(annotation
+  name: (identifier) @channel.java.annotation.name
+  arguments: (annotation_argument_list
+    (element_value_pair
+      key: (identifier) @channel.java.annotation.key
+      value: (element_value_array_initializer
+        (string_literal) @channel.name)))) @channel.java.annotation.array
+
+; Java method call with const variable: template.send(TOPIC_NAME, msg)
+(method_invocation
+  object: (_) @channel.java.var.object
+  name: (identifier) @channel.java.var.method
+  arguments: (argument_list
+    .
+    (identifier) @channel.name.var)) @channel.java.var
 `;
 
 // C queries - works with tree-sitter-c
@@ -434,6 +959,38 @@ export const GO_QUERIES = `
   (selector_expression
     operand: (_) @assignment.receiver
     field: (field_identifier) @assignment.property)) @assignment
+
+; ── Message channel captures (NATS pub/sub) ────────────────────────────────
+
+; NATS publish: nc.Publish("subject", data)
+(call_expression
+  function: (selector_expression
+    field: (field_identifier) @_go_publish (#eq? @_go_publish "Publish"))
+  arguments: (argument_list
+    (interpreted_string_literal) @channel.name)) @channel.producer.go
+
+; NATS subscribe: nc.Subscribe("subject", handler)
+(call_expression
+  function: (selector_expression
+    field: (field_identifier) @_go_subscribe (#match? @_go_subscribe "^(Queue)?Subscribe$"))
+  arguments: (argument_list
+    (interpreted_string_literal) @channel.name)) @channel.consumer.go
+
+; NATS publish with variable: nc.Publish(subjectConst, data)
+(call_expression
+  function: (selector_expression
+    field: (field_identifier) @_go_pub_var (#eq? @_go_pub_var "Publish"))
+  arguments: (argument_list
+    .
+    (identifier) @channel.name.var)) @channel.producer.go.var
+
+; NATS subscribe with variable: nc.Subscribe(subjectConst, handler)
+(call_expression
+  function: (selector_expression
+    field: (field_identifier) @_go_sub_var (#match? @_go_sub_var "^(Queue)?Subscribe$"))
+  arguments: (argument_list
+    .
+    (identifier) @channel.name.var)) @channel.consumer.go.var
 `;
 
 // C++ queries - works with tree-sitter-cpp
@@ -610,6 +1167,67 @@ export const CSHARP_QUERIES = `
     expression: (_) @assignment.receiver
     name: (identifier) @assignment.property)
   right: (_)) @assignment
+
+; ── Message channel captures (C# EventEmitter, Socket.IO wrapper, events) ─
+
+; C# method call with string first arg: obj.On("event", handler), obj.Emit("event", data)
+; Matches EventEmitter.On/Emit, SocketIoWrapper.On/Emit/EmitRequest, etc.
+(invocation_expression
+  function: (member_access_expression
+    expression: (_) @channel.object
+    name: (identifier) @channel.method)
+  arguments: (argument_list
+    (argument (string_literal) @channel.name))) @channel.csharp
+
+; C# method call with const field first arg: _socket.Emit(SOME_CONST, data)
+(invocation_expression
+  function: (member_access_expression
+    expression: (_) @channel.object
+    name: (identifier) @channel.method)
+  arguments: (argument_list
+    .
+    (argument (identifier) @channel.name.var))) @channel.csharp.var
+
+; C# generic method call with string first arg: _socket.On<T>("event", handler)
+(invocation_expression
+  function: (member_access_expression
+    expression: (_) @channel.object
+    name: (generic_name (identifier) @channel.method))
+  arguments: (argument_list
+    (argument (string_literal) @channel.name))) @channel.csharp
+
+; C# generic method call with const first arg: _socket.On<T>(CONST, handler)
+(invocation_expression
+  function: (member_access_expression
+    expression: (_) @channel.object
+    name: (generic_name (identifier) @channel.method))
+  arguments: (argument_list
+    .
+    (argument (identifier) @channel.name.var))) @channel.csharp.var
+
+; ── C# event/delegate captures ────────────────────────────────────────────
+
+; C# event field declaration: public event EventHandler<T> OnConnected;
+(event_field_declaration
+  (variable_declaration
+    (variable_declarator
+      name: (identifier) @name))) @definition.property
+
+; C# event fire: OnConnected?.Invoke(this, args)
+(invocation_expression
+  function: (conditional_access_expression
+    condition: (identifier) @event.fire.name
+    (member_binding_expression
+      name: (identifier) @_invoke (#eq? @_invoke "Invoke")))
+  arguments: (argument_list)) @event.fire
+
+; C# event subscription: obj.OnConnected += handler
+(assignment_expression
+  left: (member_access_expression
+    expression: (_) @event.receiver
+    name: (identifier) @event.name)
+  "+="
+  right: (_) @event.handler) @event.subscribe
 `;
 
 // Rust queries - works with tree-sitter-rust
@@ -774,6 +1392,78 @@ export const PHP_QUERIES = `
     scope: (_) @assignment.receiver
     name: (variable_name (name) @assignment.property))
   right: (_)) @assignment
+
+; ── Message channel captures (WordPress, Laravel, Symfony) ─────────────────
+
+; WordPress action fire: do_action('hook_name', ...)
+(function_call_expression
+  function: (name) @_wp_do_action (#match? @_wp_do_action "^do_action(_ref_array)?$")
+  arguments: (arguments
+    (argument (string (string_content) @channel.name)))) @channel.producer.wp
+
+; WordPress filter apply: apply_filters('hook_name', value, ...)
+(function_call_expression
+  function: (name) @_wp_apply_filters (#match? @_wp_apply_filters "^apply_filters(_ref_array)?$")
+  arguments: (arguments
+    (argument (string (string_content) @channel.name)))) @channel.producer.wp.filter
+
+; WordPress action listener: add_action('hook_name', callable, ...)
+(function_call_expression
+  function: (name) @_wp_add_action (#eq? @_wp_add_action "add_action")
+  arguments: (arguments
+    (argument (string (string_content) @channel.name)))) @channel.consumer.wp
+
+; WordPress filter listener: add_filter('hook_name', callable, ...)
+(function_call_expression
+  function: (name) @_wp_add_filter (#eq? @_wp_add_filter "add_filter")
+  arguments: (arguments
+    (argument (string (string_content) @channel.name)))) @channel.consumer.wp.filter
+
+; WordPress has_action/has_filter/remove_action/remove_filter:
+; These reference the same hook names — capture as consumers for graph connectivity
+(function_call_expression
+  function: (name) @_wp_ref (#match? @_wp_ref "^(has_action|has_filter|remove_action|remove_filter)$")
+  arguments: (arguments
+    (argument (string (string_content) @channel.name)))) @channel.consumer.wp.ref
+
+; Laravel event dispatch: event('event.name') — string form
+(function_call_expression
+  function: (name) @_laravel_event (#eq? @_laravel_event "event")
+  arguments: (arguments
+    (argument (string (string_content) @channel.name)))) @channel.producer.laravel
+
+; Laravel Event::listen('event.name', handler)
+(scoped_call_expression
+  scope: (name) @_laravel_scope (#eq? @_laravel_scope "Event")
+  name: (name) @_laravel_listen (#eq? @_laravel_listen "listen")
+  arguments: (arguments
+    (argument (string (string_content) @channel.name)))) @channel.consumer.laravel
+
+; Laravel Event::dispatch('event.name')
+(scoped_call_expression
+  scope: (name) @_laravel_scope2 (#eq? @_laravel_scope2 "Event")
+  name: (name) @_laravel_dispatch (#eq? @_laravel_dispatch "dispatch")
+  arguments: (arguments
+    (argument (string (string_content) @channel.name)))) @channel.producer.laravel
+
+; Symfony dispatch with event name: $dispatcher->dispatch($event, 'event.name')
+(member_call_expression
+  name: (name) @_sym_dispatch (#eq? @_sym_dispatch "dispatch")
+  arguments: (arguments
+    (argument)
+    (argument (string (string_content) @channel.name)))) @channel.producer.symfony
+
+; Symfony addListener: $dispatcher->addListener('event.name', callable)
+(member_call_expression
+  name: (name) @_sym_addlistener (#eq? @_sym_addlistener "addListener")
+  arguments: (arguments
+    (argument (string (string_content) @channel.name)))) @channel.consumer.symfony
+
+; Symfony removeListener: $dispatcher->removeListener('event.name', callable)
+(member_call_expression
+  name: (name) @_sym_removelistener (#eq? @_sym_removelistener "removeListener")
+  arguments: (arguments
+    (argument (string (string_content) @channel.name)))) @channel.consumer.symfony
 `;
 
 // Ruby queries - works with tree-sitter-ruby
@@ -833,6 +1523,27 @@ export const RUBY_QUERIES = `
     receiver: (_) @assignment.receiver
     method: (identifier) @assignment.property)
   right: (_)) @assignment
+
+; ── Message channel captures (ActiveSupport::Notifications) ────────────────
+
+; ActiveSupport instrument: instrument('event.namespace', ...)
+; Can be called as ActiveSupport::Notifications.instrument or just instrument
+(call
+  method: (identifier) @_as_instrument (#eq? @_as_instrument "instrument")
+  arguments: (argument_list
+    (string (string_content) @channel.name))) @channel.producer.ruby
+
+; ActiveSupport subscribe: subscribe('event.namespace', ...)
+(call
+  method: (identifier) @_as_subscribe (#eq? @_as_subscribe "subscribe")
+  arguments: (argument_list
+    (string (string_content) @channel.name))) @channel.consumer.ruby
+
+; ActiveSupport unsubscribe: unsubscribe('event.namespace')
+(call
+  method: (identifier) @_as_unsubscribe (#eq? @_as_unsubscribe "unsubscribe")
+  arguments: (argument_list
+    (string (string_content) @channel.name))) @channel.consumer.ruby
 `;
 
 // Kotlin queries - works with tree-sitter-kotlin (fwcd/tree-sitter-kotlin)
@@ -989,6 +1700,59 @@ export const SWIFT_QUERIES = `
 ; Extensions wrap the name in user_type unlike class/struct/enum declarations
 (class_declaration "extension" name: (user_type (type_identifier) @heritage.class)
   (inheritance_specifier inherits_from: (user_type (type_identifier) @heritage.extends))) @heritage
+
+; ── Message channel captures (NotificationCenter) ──────────────────────────
+; tree-sitter-swift wraps argument labels in value_argument_label nodes.
+; Notification names appear as:
+;   .eventName → prefix_expression with simple_identifier
+;   Notification.Name(var) → call_expression wrapping the name variable
+;   Notification.Name.staticProp → navigation_expression
+
+; NotificationCenter.default.post(name: <notification>, ...)
+; Matches both .post(name: .myEvent) and .post(name: Notification.Name(var))
+(call_expression
+  (navigation_expression
+    (navigation_suffix (simple_identifier) @_swift_post (#eq? @_swift_post "post")))
+  (call_suffix (value_arguments
+    (value_argument
+      (value_argument_label
+        (simple_identifier) @_swift_name_label (#eq? @_swift_name_label "name"))
+      (_) @channel.name)))) @channel.producer.swift
+
+; NotificationCenter.default.addObserver(forName: <notification>, ...)
+; Closure-based API: addObserver(forName:object:queue:) { handler }
+(call_expression
+  (navigation_expression
+    (navigation_suffix (simple_identifier) @_swift_observe (#eq? @_swift_observe "addObserver")))
+  (call_suffix (value_arguments
+    (value_argument
+      (value_argument_label
+        (simple_identifier) @_swift_forname (#eq? @_swift_forname "forName"))
+      (_) @channel.name)))) @channel.consumer.swift
+
+; NotificationCenter.default.addObserver(_, selector:, name: <notification>, object:)
+; Selector-based API: name: is the 3rd argument
+(call_expression
+  (navigation_expression
+    (navigation_suffix (simple_identifier) @_swift_observe2 (#eq? @_swift_observe2 "addObserver")))
+  (call_suffix (value_arguments
+    (value_argument)
+    (value_argument)
+    (value_argument
+      (value_argument_label
+        (simple_identifier) @_swift_name_label2 (#eq? @_swift_name_label2 "name"))
+      (_) @channel.name)))) @channel.consumer.swift
+
+; NotificationCenter.default.removeObserver(_, name: <notification>, object:)
+(call_expression
+  (navigation_expression
+    (navigation_suffix (simple_identifier) @_swift_remove (#eq? @_swift_remove "removeObserver")))
+  (call_suffix (value_arguments
+    (value_argument)
+    (value_argument
+      (value_argument_label
+        (simple_identifier) @_swift_remove_name (#eq? @_swift_remove_name "name"))
+      (_) @channel.name)))) @channel.consumer.swift
 
 ; Write access: obj.field = value (tree-sitter-swift 0.7.1 uses named fields)
 (assignment

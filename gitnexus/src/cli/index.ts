@@ -28,6 +28,7 @@ program
   .option('-f, --force', 'Force full re-index even if up to date')
   .option('--embeddings', 'Enable embedding generation for semantic search (off by default)')
   .option('--skills', 'Generate repo-specific skill files from detected communities')
+  .option('--context', 'Generate AGENTS.md, CLAUDE.md, and .claude/skills/ in the repo (off by default)')
   .option('--skip-git', 'Index a folder without requiring a .git directory')
    .option('-v, --verbose', 'Enable verbose ingestion warnings (default: false)')
    .addHelpText('after', '\nEnvironment variables:\n  GITNEXUS_NO_GITIGNORE=1  Skip .gitignore parsing (still reads .gitnexusignore)')
@@ -124,6 +125,18 @@ program
   .description('Execute raw Cypher query against the knowledge graph')
   .option('-r, --repo <name>', 'Target repository')
   .action(createLazyAction(() => import('./tool.js'), 'cypherCommand'));
+
+program
+  .command('verify')
+  .description('Health check all indexed repos — detect corrupted databases')
+  .action(createLazyAction(() => import('./verify.js'), 'verifyCommand'));
+
+// ─── Cross-Repo Linking ─────────────────────────────────────────────
+
+program
+  .command('link')
+  .description('Build cross-repo channel index — matches message producers to consumers across repositories (TS/JS/C#/Python/Java/PHP/Go/Ruby/Swift)')
+  .action(createLazyAction(() => import('./link.js'), 'linkCommand'));
 
 // ─── Eval Server (persistent daemon for SWE-bench) ─────────────────
 

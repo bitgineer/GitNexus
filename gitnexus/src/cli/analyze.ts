@@ -50,6 +50,8 @@ export interface AnalyzeOptions {
   verbose?: boolean;
   /** Index the folder even when no .git directory is present. */
   skipGit?: boolean;
+  /** Generate AGENTS.md, CLAUDE.md, and .claude/skills/ in the repo (off by default). */
+  context?: boolean;
 }
 
 /** Threshold: auto-skip embeddings for repos with more nodes than this */
@@ -345,6 +347,21 @@ export const analyzeCommand = async (
   };
   await saveMeta(storagePath, meta);
   await registerRepo(repoPath, meta);
+
+  // Serialize all channel references (matched and unmatched) for cross-repo linking.
+  // The `gitnexus link` command reads these to match producers↔consumers across repos.
+  if (pipelineResult.allChannels?.length) {
+    const channelsPath = path.join(storagePath, 'channels.json');
+    const channelData = pipelineResult.allChannels.map(ch => ({
+      channelName: ch.channelName,
+      role: ch.role,
+      transport: ch.transport,
+      symbolId: ch.enclosingSymbolId,
+      filePath: ch.filePath,
+      line: ch.lineNumber,
+    }));
+    await fs.writeFile(channelsPath, JSON.stringify({ channels: channelData }, null, 2));
+  }
   // Only attempt to update .gitignore when a .git directory is present.
   // Use hasGitDir (filesystem check) rather than git CLI subprocess
   // so we skip correctly for --skip-git folders even if git CLI is available.
@@ -370,14 +387,16 @@ export const analyzeCommand = async (
     generatedSkills = skillResult.skills;
   }
 
-  const aiContext = await generateAIContextFiles(repoPath, storagePath, projectName, {
-    files: pipelineResult.totalFileCount,
-    nodes: stats.nodes,
-    edges: stats.edges,
-    communities: pipelineResult.communityResult?.stats.totalCommunities,
-    clusters: aggregatedClusterCount,
-    processes: pipelineResult.processResult?.stats.totalProcesses,
-  }, generatedSkills);
+  const aiContext = options?.context
+    ? await generateAIContextFiles(repoPath, storagePath, projectName, {
+        files: pipelineResult.totalFileCount,
+        nodes: stats.nodes,
+        edges: stats.edges,
+        communities: pipelineResult.communityResult?.stats.totalCommunities,
+        clusters: aggregatedClusterCount,
+        processes: pipelineResult.processResult?.stats.totalProcesses,
+      }, generatedSkills)
+    : { files: [] as string[] };
 
   await closeLbug();
   // Note: we intentionally do NOT call disposeEmbedder() here.

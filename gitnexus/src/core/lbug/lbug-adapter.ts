@@ -18,6 +18,36 @@ let conn: lbug.Connection | null = null;
 let currentDbPath: string | null = null;
 let ftsLoaded = false;
 
+/**
+ * Retry wrapper for filesystem and DB operations that may fail due to
+ * WSL I/O transient errors (EIO, ENOENT on /mnt/c/).
+ * Retries up to `maxRetries` times with exponential backoff.
+ */
+const withRetry = async <T>(
+  operation: () => Promise<T>,
+  label: string,
+  maxRetries = 3,
+  baseDelayMs = 500,
+): Promise<T> => {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await operation();
+    } catch (err: any) {
+      const code = err?.code ?? '';
+      const isTransient = code === 'EIO' || code === 'ENOENT' || code === 'EAGAIN' || code === 'EBUSY'
+        || (err?.message?.includes?.('i/o error') ?? false)
+        || (err?.message?.includes?.('Reading past the end') ?? false);
+      if (!isTransient || attempt === maxRetries) throw err;
+      const delay = baseDelayMs * Math.pow(2, attempt);
+      if (process.env.GITNEXUS_VERBOSE) {
+        console.warn(`⚠️ ${label}: transient I/O error (${code || err?.message?.slice(0, 40)}), retry ${attempt + 1}/${maxRetries} in ${delay}ms`);
+      }
+      await new Promise(r => setTimeout(r, delay));
+    }
+  }
+  throw new Error(`${label}: unreachable`);
+};
+
 /** Expose the current Database for pool adapter reuse in tests. */
 export const getDatabase = (): lbug.Database | null => db;
 
@@ -186,7 +216,13 @@ export const loadGraphToLbug = async (
 
   const log = onProgress || (() => {});
 
-  const csvDir = path.join(storagePath, 'csv');
+  // Use /tmp for CSV staging when the target is on a non-native filesystem (e.g., /mnt/c/ in WSL).
+  // This avoids transient EIO errors during heavy writes to NTFS via Plan 9.
+  const isNonNativeFs = storagePath.startsWith('/mnt/');
+  const stagingDir = isNonNativeFs
+    ? path.join('/tmp', `gitnexus-staging-${Date.now()}`)
+    : storagePath;
+  const csvDir = path.join(stagingDir, 'csv');
 
   log('Streaming CSVs to disk...');
   const csvResult = await streamAllCSVsToDisk(graph, repoPath, csvDir);
@@ -268,7 +304,7 @@ export const loadGraphToLbug = async (
       pairIdx++;
       const [fromLabel, toLabel] = pairKey.split('|');
       const pairCsvPath = path.join(csvDir, `rel_${fromLabel}_${toLabel}.csv`);
-      await fs.writeFile(pairCsvPath, relHeader + '\n' + lines.join('\n'), 'utf-8');
+      await withRetry(() => fs.writeFile(pairCsvPath, relHeader + '\n' + lines.join('\n'), 'utf-8'), `CSV write ${fromLabel}->${toLabel}`);
       const normalizedPath = normalizeCopyPath(pairCsvPath);
       const copyQuery = `COPY ${REL_TABLE_NAME} FROM "${normalizedPath}" (from="${fromLabel}", to="${toLabel}", HEADER=true, ESCAPE='"', DELIM=',', QUOTE='"', PARALLEL=false, auto_detect=false)`;
 
@@ -284,6 +320,9 @@ export const loadGraphToLbug = async (
           await conn.query(retryQuery);
         } catch (retryErr) {
           const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
+          if (process.env.GITNEXUS_VERBOSE) {
+            console.error(`  ⚠️ COPY failed for ${fromLabel}->${toLabel} (${lines.length} edges): ${retryMsg.slice(0, 200)}`);
+          }
           warnings.push(`${fromLabel}->${toLabel} (${lines.length} edges): ${retryMsg.slice(0, 80)}`);
           failedPairEdges += lines.length;
           failedPairLines.push(...lines);
@@ -310,6 +349,11 @@ export const loadGraphToLbug = async (
     }
   } catch {}
   try { await fs.rmdir(csvDir); } catch {}
+
+  // Clean up staging directory if we used /tmp
+  if (isNonNativeFs && stagingDir !== storagePath) {
+    try { await fs.rm(stagingDir, { recursive: true, force: true }); } catch {}
+  }
 
   return { success: true, insertedRels, skippedRels, warnings };
 };
@@ -343,27 +387,30 @@ const fallbackRelationshipInserts = async (
     return BACKTICK_TABLES.has(label) ? `\`${label}\`` : label;
   };
 
+  const esc = (s: string) => s.replace(/'/g, "''").replace(/\\/g, '\\\\').replace(/\n/g, '\\n').replace(/\r/g, '\\r');
   for (let i = 1; i < validRelLines.length; i++) {
     const line = validRelLines[i];
+    const match = line.match(/"([^"]*)","([^"]*)","([^"]*)",([0-9.]+),"([^"]*)",([0-9-]+)/);
+    if (!match) continue;
+    const [, fromId, toId, relType, confidenceStr, reason, stepStr] = match;
+    const fromLabel = getNodeLabel(fromId);
+    const toLabel = getNodeLabel(toId);
+    if (!validTables.has(fromLabel) || !validTables.has(toLabel)) continue;
+
+    const confidence = parseFloat(confidenceStr) || 1.0;
+    const step = parseInt(stepStr) || 0;
+
     try {
-      const match = line.match(/"([^"]*)","([^"]*)","([^"]*)",([0-9.]+),"([^"]*)",([0-9-]+)/);
-      if (!match) continue;
-      const [, fromId, toId, relType, confidenceStr, reason, stepStr] = match;
-      const fromLabel = getNodeLabel(fromId);
-      const toLabel = getNodeLabel(toId);
-      if (!validTables.has(fromLabel) || !validTables.has(toLabel)) continue;
-
-      const confidence = parseFloat(confidenceStr) || 1.0;
-      const step = parseInt(stepStr) || 0;
-
-      const esc = (s: string) => s.replace(/'/g, "''").replace(/\\/g, '\\\\').replace(/\n/g, '\\n').replace(/\r/g, '\\r');
       await conn.query(`
         MATCH (a:${escapeLabel(fromLabel)} {id: '${esc(fromId)}' }),
               (b:${escapeLabel(toLabel)} {id: '${esc(toId)}' })
         CREATE (a)-[:${REL_TABLE_NAME} {type: '${esc(relType)}', confidence: ${confidence}, reason: '${esc(reason)}', step: ${step}}]->(b)
       `);
-    } catch {
-      // skip
+    } catch (e) {
+      if (process.env.GITNEXUS_VERBOSE) {
+        const msg = e instanceof Error ? e.message : String(e);
+        console.error(`  ⚠️ Fallback INSERT failed: ${escapeLabel(fromLabel)}(${fromId.slice(0,60)}) -> ${escapeLabel(toLabel)}(${toId.slice(0,60)}): ${msg.slice(0, 150)}`);
+      }
     }
   }
 };

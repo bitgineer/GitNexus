@@ -374,6 +374,9 @@ export class LocalBackend {
     if (method === 'list_repos') {
       return this.listRepos();
     }
+    if (method === 'cross_repo_channels') {
+      return this.crossRepoChannels(params);
+    }
 
     // Resolve repo from optional param (re-reads registry on miss)
     const repo = await this.resolveRepo(params?.repo);
@@ -2460,5 +2463,80 @@ export class LocalBackend {
     this.repos.clear();
     this.contextCache.clear();
     this.initializedRepos.clear();
+  }
+
+  /**
+   * Cross-repo channel tool — reads ~/.gitnexus/cross-repo-channels.json
+   * built by `gitnexus link` and returns matched channels.
+   */
+  private async crossRepoChannels(params: any): Promise<any> {
+    const { getGlobalDir } = await import('../../storage/repo-manager.js');
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+
+    const registryPath = path.join(getGlobalDir(), 'cross-repo-channels.json');
+    let registry: any;
+    try {
+      const raw = await fs.readFile(registryPath, 'utf-8');
+      registry = JSON.parse(raw);
+    } catch {
+      return {
+        markdown: '**No cross-repo channel registry found.** Run `gitnexus link` to build it.\n\n' +
+          'This command scans all indexed repos for message channels (Socket.IO, Electron IPC, EventEmitter, C# events, ' +
+          'Python Socket.IO/Celery/Redis, Java Kafka/JMS/RabbitMQ, PHP WordPress hooks/Laravel/Symfony events, ' +
+          'Go NATS, Ruby ActiveSupport, Swift NotificationCenter) ' +
+          'and matches producers to consumers across repo boundaries.',
+      };
+    }
+
+    const channelFilter = params?.channel?.toLowerCase();
+    const repoFilter = params?.repo?.toLowerCase();
+    const transportFilter = params?.transport?.toLowerCase();
+
+    let channels = registry.channels || [];
+
+    // Apply filters
+    if (channelFilter) {
+      channels = channels.filter((ch: any) => ch.channelName.toLowerCase().includes(channelFilter));
+    }
+    if (repoFilter) {
+      channels = channels.filter((ch: any) =>
+        ch.producers.some((p: any) => p.repo.toLowerCase().includes(repoFilter)) ||
+        ch.consumers.some((c: any) => c.repo.toLowerCase().includes(repoFilter))
+      );
+    }
+    if (transportFilter) {
+      channels = channels.filter((ch: any) => ch.transport?.toLowerCase().includes(transportFilter));
+    }
+
+    if (channels.length === 0) {
+      const filterDesc = [channelFilter && `channel="${channelFilter}"`, repoFilter && `repo="${repoFilter}"`, transportFilter && `transport="${transportFilter}"`].filter(Boolean).join(', ');
+      return {
+        markdown: `No cross-repo channels found${filterDesc ? ` matching ${filterDesc}` : ''}.\n\n` +
+          `Registry has ${registry.crossRepoMatches ?? 0} cross-repo matches and ${registry.sameRepoMatches ?? 0} same-repo matches across ${registry.reposWithChannels ?? 0} repos.\n` +
+          `Generated: ${registry.generatedAt ?? 'unknown'}`,
+      };
+    }
+
+    // Build markdown table
+    const lines: string[] = [];
+    lines.push(`## Cross-Repo Message Channels`);
+    lines.push('');
+    lines.push(`Registry: ${registry.reposWithChannels} repos, ${registry.uniqueChannelNames} channels, ${registry.crossRepoMatches} cross-repo matches`);
+    lines.push(`Generated: ${registry.generatedAt}`);
+    lines.push('');
+    lines.push('| Channel | Transport | Producers | Consumers |');
+    lines.push('| --- | --- | --- | --- |');
+
+    for (const ch of channels) {
+      const prods = [...new Set((ch.producers || []).map((p: any) => p.repo))].join(', ');
+      const cons = [...new Set((ch.consumers || []).map((c: any) => c.repo))].join(', ');
+      lines.push(`| ${ch.channelName} | ${ch.transport} | ${prods} | ${cons} |`);
+    }
+
+    lines.push('');
+    lines.push(`**${channels.length} channels shown.** ${registry.unmatchedProducers ?? 0} producers and ${registry.unmatchedConsumers ?? 0} consumers have no cross-repo match.`);
+
+    return { markdown: lines.join('\n'), row_count: channels.length };
   }
 }
