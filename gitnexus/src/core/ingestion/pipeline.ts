@@ -1,6 +1,7 @@
 import { createKnowledgeGraph } from '../graph/graph.js';
 import { processStructure } from './structure-processor.js';
 import { processMarkdown } from './markdown-processor.js';
+import { processCobol, isCobolFile, isJclFile } from './cobol-processor.js';
 import { processParsing } from './parsing-processor.js';
 import {
   processImports,
@@ -15,7 +16,7 @@ import { phpFileToRouteURL } from './route-extractors/php.js';
 import { extractResponseShapes, extractPHPResponseShapes } from './route-extractors/response-shapes.js';
 import { extractMiddlewareChain, extractNextjsMiddlewareConfig, compileMatcher, compiledMatcherMatchesRoute } from './route-extractors/middleware.js';
 import { generateId } from '../../lib/utils.js';
-import type { ExtractedFetchCall, ExtractedRoute, ExtractedDecoratorRoute, ExtractedToolDef, ExtractedChannel, ExtractedEventRef, ExtractedOverride, ExtractedExtensionMethod, ExtractedContextRef, FileConstValues } from './workers/parse-worker.js';
+import type { ExtractedFetchCall, ExtractedRoute, ExtractedDecoratorRoute, ExtractedToolDef, ExtractedChannel, ExtractedEventRef, ExtractedOverride, ExtractedExtensionMethod, ExtractedContextRef, FileConstValues, ExtractedORMQuery } from './workers/parse-worker.js';
 import { resolveChannels, resolveConstChannelNames, resolveEvents, resolveContexts } from './channel-resolver.js';
 import { unifyPartialClasses } from './partial-class-processor.js';
 import { processOverrides } from './override-processor.js';
@@ -467,6 +468,14 @@ async function runScanAndStructure(
     stats: { filesProcessed: totalFiles, totalFiles, nodesCreated: graph.nodeCount },
   });
 
+  // ── Custom (non-tree-sitter) processors ─────────────────────────────
+  // Each custom processor follows the pattern in markdown-processor.ts:
+  //   1. Export a process function: (graph, files, allPathSet) => result
+  //   2. Export a file detection function: (path) => boolean
+  //   3. Filter files by extension, write nodes/edges directly to graph
+  // To add a new language: create a new processor file, import it here,
+  // and add a filter-read-call-log block following the pattern below.
+
   // ── Phase 2.5: Markdown processing (headings + cross-links) ────────
   const mdScanned = scannedFiles.filter(f => f.path.endsWith('.md') || f.path.endsWith('.mdx'));
   if (mdScanned.length > 0) {
@@ -478,6 +487,26 @@ async function runScanAndStructure(
     const mdResult = processMarkdown(graph, mdFiles, allPathSet);
     if (isDev) {
       console.log(`  Markdown: ${mdResult.sections} sections, ${mdResult.links} cross-links from ${mdFiles.length} files`);
+    }
+  }
+
+  // ── Phase 2.6: COBOL processing (regex extraction, no tree-sitter) ──
+  const cobolScanned = scannedFiles.filter(f => isCobolFile(f.path) || isJclFile(f.path));
+  if (cobolScanned.length > 0) {
+    const cobolContents = await readFileContents(repoPath, cobolScanned.map(f => f.path));
+    const cobolFiles = cobolScanned
+      .filter(f => cobolContents.has(f.path))
+      .map(f => ({ path: f.path, content: cobolContents.get(f.path)! }));
+    const allPathSet = new Set(allPaths);
+    const cobolResult = processCobol(graph, cobolFiles, allPathSet);
+    if (isDev) {
+      console.log(`  COBOL: ${cobolResult.programs} programs, ${cobolResult.paragraphs} paragraphs, ${cobolResult.sections} sections from ${cobolFiles.length} files`);
+      if (cobolResult.execSqlBlocks > 0 || cobolResult.execCicsBlocks > 0 || cobolResult.entryPoints > 0) {
+        console.log(`  COBOL enriched: ${cobolResult.execSqlBlocks} SQL blocks, ${cobolResult.execCicsBlocks} CICS blocks, ${cobolResult.entryPoints} entry points, ${cobolResult.moves} moves, ${cobolResult.fileDeclarations} file declarations`);
+      }
+      if (cobolResult.jclJobs > 0) {
+        console.log(`  JCL: ${cobolResult.jclJobs} jobs, ${cobolResult.jclSteps} steps`);
+      }
     }
   }
 
@@ -523,6 +552,7 @@ async function runChunkedParseAndResolve(
   allExtensionMethods: ExtractedExtensionMethod[];
   allContextRefs: ExtractedContextRef[];
   allConstValues: FileConstValues[];
+  allORMQueries: ExtractedORMQuery[];
 }> {
   const symbolTable = ctx.symbols;
 
@@ -653,6 +683,7 @@ async function runChunkedParseAndResolve(
   const allExtensionMethods: ExtractedExtensionMethod[] = [];
   const allContextRefs: ExtractedContextRef[] = [];
   const allConstValues: FileConstValues[] = [];
+    const allORMQueries: ExtractedORMQuery[] = [];
 
   try {
     for (let chunkIdx = 0; chunkIdx < numChunks; chunkIdx++) {
@@ -799,6 +830,9 @@ async function runChunkedParseAndResolve(
         if (chunkWorkerData.constValues?.length) {
           allConstValues.push(...chunkWorkerData.constValues);
         }
+        if (chunkWorkerData.ormQueries?.length) {
+          allORMQueries.push(...chunkWorkerData.ormQueries);
+        }
       } else {
         await processImports(graph, chunkFiles, astCache, ctx, undefined, repoPath, allPaths);
         sequentialChunkPaths.push(chunkPaths);
@@ -833,6 +867,10 @@ async function runChunkedParseAndResolve(
     const chunkFetchCalls = await extractFetchCallsFromFiles(chunkFiles, astCache);
     if (chunkFetchCalls.length > 0) {
       allFetchCalls.push(...chunkFetchCalls);
+    }
+    // Extract ORM queries (sequential path)
+    for (const f of chunkFiles) {
+      extractORMQueriesInline(f.path, f.content, allORMQueries);
     }
     astCache.clear();
   }
@@ -890,7 +928,7 @@ async function runChunkedParseAndResolve(
   importCtx.index = EMPTY_INDEX; // Release suffix index memory (~30MB for large repos)
   importCtx.normalizedFileList = [];
 
-  return { exportedTypeMap, allFetchCalls, allExtractedRoutes, allDecoratorRoutes, allToolDefs, allChannels, allEventRefs, allOverrides, allExtensionMethods, allContextRefs, allConstValues };
+  return { exportedTypeMap, allFetchCalls, allExtractedRoutes, allDecoratorRoutes, allToolDefs, allChannels, allEventRefs, allOverrides, allExtensionMethods, allContextRefs, allConstValues, allORMQueries };
 }
 
 /**
@@ -1112,7 +1150,7 @@ export const runPipelineFromRepo = async (
     const { scannedFiles, allPaths, totalFiles } = await runScanAndStructure(repoPath, graph, onProgress);
 
     // Phase 3+4: Chunked parse + resolve (imports, calls, heritage, routes)
-    const { exportedTypeMap, allFetchCalls, allExtractedRoutes, allDecoratorRoutes, allToolDefs, allChannels, allEventRefs, allOverrides, allExtensionMethods, allContextRefs, allConstValues } = await runChunkedParseAndResolve(
+    const { exportedTypeMap, allFetchCalls, allExtractedRoutes, allDecoratorRoutes, allToolDefs, allChannels, allEventRefs, allOverrides, allExtensionMethods, allContextRefs, allConstValues, allORMQueries } = await runChunkedParseAndResolve(
       graph, ctx, scannedFiles, allPaths, totalFiles, repoPath, pipelineStart, onProgress,
     );
 
@@ -1453,6 +1491,11 @@ export const runPipelineFromRepo = async (
       }
     }
 
+    // ── Phase 3.7: ORM Dataflow Detection (Prisma + Supabase) ──────────
+    if (allORMQueries.length > 0) {
+      processORMQueries(graph, allORMQueries, isDev);
+    }
+
     // ── Phase 14: Cross-file binding propagation (topological level sort) ──
     await runCrossFileBindingPropagation(
       graph, ctx, exportedTypeMap, allPaths, totalFiles, repoPath, pipelineStart, onProgress,
@@ -1487,3 +1530,92 @@ export const runPipelineFromRepo = async (
     throw error;
   }
 };
+
+// Inline ORM regex extraction (avoids importing parse-worker which has worker-only code)
+const PRISMA_QUERY_RE = /\bprisma\.(\w+)\.(findMany|findFirst|findUnique|findUniqueOrThrow|findFirstOrThrow|create|createMany|update|updateMany|delete|deleteMany|upsert|count|aggregate|groupBy)\s*\(/g;
+const SUPABASE_QUERY_RE = /\bsupabase\.from\s*\(\s*['"](\w+)['"]\s*\)\s*\.(select|insert|update|delete|upsert)\s*\(/g;
+
+function extractORMQueriesInline(filePath: string, content: string, out: ExtractedORMQuery[]): void {
+  const hasPrisma = content.includes('prisma.');
+  const hasSupabase = content.includes('supabase.from');
+  if (!hasPrisma && !hasSupabase) return;
+
+  if (hasPrisma) {
+    PRISMA_QUERY_RE.lastIndex = 0;
+    let m;
+    while ((m = PRISMA_QUERY_RE.exec(content)) !== null) {
+      const model = m[1];
+      if (model.startsWith('$')) continue;
+      out.push({ filePath, orm: 'prisma', model, method: m[2], lineNumber: content.substring(0, m.index).split('\n').length - 1 });
+    }
+  }
+
+  if (hasSupabase) {
+    SUPABASE_QUERY_RE.lastIndex = 0;
+    let m;
+    while ((m = SUPABASE_QUERY_RE.exec(content)) !== null) {
+      out.push({ filePath, orm: 'supabase', model: m[1], method: m[2], lineNumber: content.substring(0, m.index).split('\n').length - 1 });
+    }
+  }
+}
+
+// ============================================================================
+// ORM Query Processing — creates QUERIES edges from callers to model nodes
+// ============================================================================
+
+function processORMQueries(
+  graph: ReturnType<typeof createKnowledgeGraph>,
+  queries: ExtractedORMQuery[],
+  isDev: boolean,
+): void {
+  const modelNodes = new Map<string, string>();
+  const seenEdges = new Set<string>();
+  let edgesCreated = 0;
+
+  for (const q of queries) {
+    const modelKey = `${q.orm}:${q.model}`;
+    let modelNodeId = modelNodes.get(modelKey);
+    if (!modelNodeId) {
+      const candidateIds = [
+        generateId('Class', `${q.model}`),
+        generateId('Interface', `${q.model}`),
+        generateId('CodeElement', `${q.model}`),
+      ];
+      const existing = candidateIds.find(id => graph.getNode(id));
+      if (existing) {
+        modelNodeId = existing;
+      } else {
+        modelNodeId = generateId('CodeElement', `${q.orm}:${q.model}`);
+        graph.addNode({
+          id: modelNodeId,
+          label: 'CodeElement',
+          properties: {
+            name: q.model,
+            filePath: '',
+            description: `${q.orm} model/table: ${q.model}`,
+          },
+        });
+      }
+      modelNodes.set(modelKey, modelNodeId);
+    }
+
+    const fileId = generateId('File', q.filePath);
+    const edgeKey = `${fileId}->${modelNodeId}:${q.method}`;
+    if (seenEdges.has(edgeKey)) continue;
+    seenEdges.add(edgeKey);
+
+    graph.addRelationship({
+      id: generateId('QUERIES', edgeKey),
+      sourceId: fileId,
+      targetId: modelNodeId,
+      type: 'QUERIES',
+      confidence: 0.9,
+      reason: `${q.orm}-${q.method}`,
+    });
+    edgesCreated++;
+  }
+
+  if (isDev) {
+    console.log(`ORM dataflow: ${edgesCreated} QUERIES edges, ${modelNodes.size} models (${queries.length} total calls)`);
+  }
+}

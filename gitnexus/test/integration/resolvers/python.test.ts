@@ -4,7 +4,7 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import path from 'path';
 import {
-  FIXTURES, CROSS_FILE_FIXTURES, getRelationships, getNodesByLabel, edgeSet,
+  FIXTURES, CROSS_FILE_FIXTURES, getRelationships, getNodesByLabel, getNodesByLabelFull, edgeSet,
   runPipelineFromRepo, type PipelineResult,
 } from './helpers.js';
 
@@ -333,6 +333,94 @@ describe('Python plain import alias resolution (import X as Y)', () => {
     const loginCall = calls.find(c => c.target === 'login' && c.source === 'main');
     expect(loginCall).toBeDefined();
     expect(loginCall!.targetFilePath).toBe('auth.py');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Same-name collision: import X as alias; alias.func() where caller is also named func
+// Issue #417 — module-alias disambiguation must override same-file tier
+// ---------------------------------------------------------------------------
+
+describe('Python same-name collision via module alias (Issue #417)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'python-same-name-collision'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves app_metrics.get_metrics() to metrics.py, not self (same-name collision)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const getMetricsCall = calls.find(
+      c => c.source === 'get_metrics' && c.target === 'get_metrics',
+    );
+    expect(getMetricsCall).toBeDefined();
+    // Must resolve to metrics.py, NOT router.py (self-call)
+    expect(getMetricsCall!.sourceFilePath).toBe('router.py');
+    expect(getMetricsCall!.targetFilePath).toBe('metrics.py');
+  });
+
+  it('emits IMPORTS edge: router.py → metrics.py (module alias registered)', () => {
+    const imports = getRelationships(result, 'IMPORTS');
+    const metricsImport = imports.find(
+      i => i.sourceFilePath === 'router.py' && i.targetFilePath === 'metrics.py',
+    );
+    expect(metricsImport).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Ancestor directory import: Python single-segment import resolved via ancestor walk
+// Issue #417 — prevents cross-language misresolution when suffix matching picks .ts over .py
+// ---------------------------------------------------------------------------
+
+describe('Python ancestor directory import resolution (Issue #417)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'python-ancestor-import'),
+      () => {},
+    );
+  }, 60000);
+
+  it('resolves from middleware import to backend/middleware.py, not frontend/middleware.ts', () => {
+    const imports = getRelationships(result, 'IMPORTS');
+    const middlewareImport = imports.find(
+      i => i.sourceFilePath === 'backend/services/auth.py' && i.targetFilePath.includes('middleware'),
+    );
+    expect(middlewareImport).toBeDefined();
+    expect(middlewareImport!.targetFilePath).toBe('backend/middleware.py');
+  });
+
+  it('resolves _canonical() call to middleware.py:get_remaining_slots via alias', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const canonicalCall = calls.find(
+      c => c.source === 'get_remaining_slots' && c.sourceFilePath === 'backend/services/auth.py',
+    );
+    expect(canonicalCall).toBeDefined();
+    expect(canonicalCall!.target).toBe('get_remaining_slots');
+    expect(canonicalCall!.targetFilePath).toBe('backend/middleware.py');
+  });
+
+  it('resolves depth-2 ancestor import: a/b/c/deep.py → a/utils.py (not suffix match)', () => {
+    const imports = getRelationships(result, 'IMPORTS');
+    const utilsImport = imports.find(
+      i => i.sourceFilePath === 'a/b/c/deep.py' && i.targetFilePath.includes('utils'),
+    );
+    expect(utilsImport).toBeDefined();
+    expect(utilsImport!.targetFilePath).toBe('a/utils.py');
+  });
+
+  it('resolves format_currency() call across depth-2 ancestor import', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const fmtCall = calls.find(
+      c => c.source === 'render_price' && c.target === 'format_currency',
+    );
+    expect(fmtCall).toBeDefined();
+    expect(fmtCall!.targetFilePath).toBe('a/utils.py');
   });
 });
 
@@ -1355,6 +1443,23 @@ describe('Field type resolution (Python)', () => {
       e => e.source === 'process_user' && e.targetFilePath.includes('models'),
     );
     expect(addressSave).toBeDefined();
+  });
+
+  it('populates field metadata (visibility, isStatic, isReadonly) on Property nodes', () => {
+    const properties = getNodesByLabelFull(result, 'Property');
+
+    const city = properties.find(p => p.name === 'city');
+    expect(city).toBeDefined();
+    expect(city!.properties.visibility).toBe('public');
+    expect(city!.properties.isStatic).toBe(false);
+    expect(city!.properties.isReadonly).toBe(false);
+    expect(city!.properties.declaredType).toBe('str');
+
+    const addr = properties.find(p => p.name === 'address');
+    expect(addr).toBeDefined();
+    expect(addr!.properties.visibility).toBe('public');
+    expect(addr!.properties.isStatic).toBe(false);
+    expect(addr!.properties.declaredType).toBe('Address');
   });
 });
 

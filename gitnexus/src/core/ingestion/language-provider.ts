@@ -13,6 +13,7 @@ import type { SupportedLanguages } from '../../config/supported-languages.js';
 import type { LanguageTypeConfig } from './type-extractors/types.js';
 import type { CallRouter } from './call-routing.js';
 import type { ExportChecker } from './export-detection.js';
+import type { FieldExtractor } from './field-extractor.js';
 import type { ImportResolverFn } from './import-resolvers/types.js';
 import type { NamedBindingExtractorFn } from './named-bindings/types.js';
 import type { SyntaxNode } from './utils/ast-helpers.js';
@@ -40,7 +41,12 @@ interface LanguageProviderConfig {
   readonly extensions: readonly string[];
 
   // ── Parser ────────────────────────────────────────────────────────
-  /** Tree-sitter query strings for definitions, imports, calls, heritage */
+  /** Parse strategy: 'tree-sitter' (default) uses AST parsing via tree-sitter.
+   *  'standalone' means the language has its own regex-based processor and
+   *  should be skipped by the tree-sitter pipeline (e.g., COBOL, Markdown). */
+  readonly parseStrategy?: 'tree-sitter' | 'standalone';
+  /** Tree-sitter query strings for definitions, imports, calls, heritage.
+   *  Required for tree-sitter languages; empty string for standalone processors. */
   readonly treeSitterQueries: string;
 
   // ── Core (required) ───────────────────────────────────────────────
@@ -79,6 +85,17 @@ interface LanguageProviderConfig {
     projectConfig: unknown,
   ) => void;
 
+  // ── Enclosing function resolution ───────────────────────────────
+  /** Resolve the enclosing function name + label from an AST ancestor node
+   *  that is NOT a standard FUNCTION_NODE_TYPE.  For languages where the
+   *  function body is a sibling of the signature (e.g. Dart: function_body ↔
+   *  function_signature are siblings under program/class_body), the default
+   *  parent walk cannot find the enclosing function.  This hook lets the
+   *  language provider inspect each ancestor and return the resolved result.
+   *  Return null to continue the default walk.
+   *  Default: undefined (standard parent walk only). */
+  readonly enclosingFunctionFinder?: (ancestorNode: SyntaxNode) => { funcName: string; label: NodeLabel } | null;
+
   // ── Labels ────────────────────────────────────────────────────────
   /** Override the default node label for definition.function captures.
    *  Return null to skip (C/C++ duplicate), a different label to reclassify
@@ -98,6 +115,10 @@ interface LanguageProviderConfig {
   readonly mroStrategy?: MroStrategy;
 
   // ── Language-specific extraction hooks ────────────────────────────
+  /** Field extractor for extracting field/property definitions from class/struct
+   *  declarations. Produces FieldInfo[] with name, type, visibility, static,
+   *  readonly metadata. Default: undefined (no field extraction). */
+  readonly fieldExtractor?: FieldExtractor;
   /** Extract a semantic description for a definition node (e.g., PHP Eloquent
    *  property arrays, relation method descriptions).
    *  Default: undefined (no description extraction). */
@@ -110,6 +131,11 @@ interface LanguageProviderConfig {
    *  When true, the worker extracts routes via the language's route extraction logic.
    *  Default: undefined (no route files). */
   readonly isRouteFile?: (filePath: string) => boolean;
+
+  // ── Noise filtering ────────────────────────────────────────────────
+  /** Built-in/stdlib names that should be filtered from the call graph for this language.
+   *  Default: undefined (no language-specific filtering). */
+  readonly builtInNames?: ReadonlySet<string>;
 }
 
 /** Runtime type — same as LanguageProviderConfig but with defaults guaranteed present. */
@@ -119,6 +145,8 @@ export interface LanguageProvider extends Omit<LanguageProviderConfig,
   readonly importSemantics: ImportSemantics;
   readonly heritageDefaultEdge: 'EXTENDS' | 'IMPLEMENTS';
   readonly mroStrategy: MroStrategy;
+  /** Check if a name is a built-in/stdlib function that should be filtered from the call graph. */
+  readonly isBuiltInName: (name: string) => boolean;
 }
 
 const DEFAULTS: Pick<LanguageProvider, 'importSemantics' | 'heritageDefaultEdge' | 'mroStrategy'> = {
@@ -129,5 +157,10 @@ const DEFAULTS: Pick<LanguageProvider, 'importSemantics' | 'heritageDefaultEdge'
 
 /** Define a language provider — required fields must be supplied, optional fields get sensible defaults. */
 export function defineLanguage(config: LanguageProviderConfig): LanguageProvider {
-  return { ...DEFAULTS, ...config };
+  const builtIns = config.builtInNames;
+  return {
+    ...DEFAULTS,
+    ...config,
+    isBuiltInName: builtIns ? (name: string) => builtIns.has(name) : () => false,
+  };
 }

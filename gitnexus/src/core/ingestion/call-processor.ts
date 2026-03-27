@@ -11,7 +11,6 @@ import { getLanguageFromFilename } from './utils/language-detection.js';
 import { isVerboseIngestionEnabled } from './utils/verbose.js';
 import { yieldToEventLoop } from './utils/event-loop.js';
 import { FUNCTION_NODE_TYPES, extractFunctionName, findEnclosingClassId } from './utils/ast-helpers.js';
-import { isBuiltInOrNoise } from './utils/noise-filter.js';
 import {
   countCallArguments,
   inferCallForm,
@@ -210,6 +209,26 @@ const findEnclosingFunction = (
         return generateId(finalLabel, `${filePath}:${funcName}`);
       }
     }
+
+    // Language-specific enclosing function resolution (e.g., Dart where
+    // function_body is a sibling of function_signature, not a child).
+    if (provider.enclosingFunctionFinder) {
+      const customResult = provider.enclosingFunctionFinder(current);
+      if (customResult) {
+        // Try SymbolTable first (same pattern as the FUNCTION_NODE_TYPES branch above).
+        const resolved = ctx.resolve(customResult.funcName, filePath);
+        if (resolved?.tier === 'same-file' && resolved.candidates.length > 0) {
+          return resolved.candidates[0].nodeId;
+        }
+        let finalLabel = customResult.label;
+        if (provider.labelOverride) {
+          const override = provider.labelOverride(current.previousSibling!, finalLabel);
+          if (override !== null) finalLabel = override;
+        }
+        return generateId(finalLabel, `${filePath}:${customResult.funcName}`);
+      }
+    }
+
     current = current.parent;
   }
 
@@ -376,7 +395,7 @@ export const processCalls = async (
     const importedBindings = importedBindingsMap?.get(file.path);
     const importedReturnTypes = importedReturnTypesMap?.get(file.path);
     const importedRawReturnTypes = importedRawReturnTypesMap?.get(file.path);
-    const typeEnv = buildTypeEnv(tree, language, { symbolTable: ctx.symbols, parentMap, importedBindings, importedReturnTypes, importedRawReturnTypes });
+    const typeEnv = buildTypeEnv(tree, language, { symbolTable: ctx.symbols, parentMap, importedBindings, importedReturnTypes, importedRawReturnTypes, enclosingFunctionFinder: provider?.enclosingFunctionFinder });
     if (typeEnv && exportedTypeMap) {
       const fileExports = collectExportedBindings(typeEnv, file.path, ctx.symbols, graph);
       if (fileExports) exportedTypeMap.set(file.path, fileExports);
@@ -389,6 +408,7 @@ export const processCalls = async (
     const receiverIndex = buildReceiverTypeIndex(verifiedReceivers);
 
     ctx.enableCache(file.path);
+    const widenCache: WidenCache = new Map();
 
     matches.forEach(match => {
       const captureMap: Record<string, any> = {};
@@ -496,7 +516,7 @@ export const processCalls = async (
         }
       }
 
-      if (isBuiltInOrNoise(calledName)) return;
+      if (provider.isBuiltInName(calledName)) return;
 
       const callNode = captureMap['call'];
       const callForm = inferCallForm(callNode, nameNode);
@@ -604,7 +624,7 @@ export const processCalls = async (
         callForm,
         receiverTypeName,
         receiverName,
-      }, file.path, ctx, hints);
+      }, file.path, ctx, hints, widenCache);
 
       if (!resolved) return;
       const relId = generateId('CALLS', `${sourceId}:${calledName}->${resolved.nodeId}`);
@@ -822,11 +842,15 @@ const tryOverloadDisambiguation = (
  *
  * If filtering still leaves multiple candidates, refuse to emit a CALLS edge.
  */
+/** Per-file cache for the widen path's lookupFuzzy calls. Cleared between files. */
+type WidenCache = Map<string, readonly SymbolDefinition[]>;
+
 const resolveCallTarget = (
   call: Pick<ExtractedCall, 'calledName' | 'argCount' | 'callForm' | 'receiverTypeName' | 'receiverName'>,
   currentFile: string,
   ctx: ResolutionContext,
   overloadHints?: OverloadHints,
+  widenCache?: WidenCache,
 ): ResolveResult | null => {
   const tiered = ctx.resolve(call.calledName, currentFile);
   if (!tiered) return null;
@@ -853,16 +877,33 @@ const resolveCallTarget = (
     filteredCandidates = filterCallableCandidates(tiered.candidates, call.argCount, 'constructor');
   }
 
-  // Module-alias disambiguation: Python `import auth; auth.User()` — when both models.py and
-  // auth.py export User, receiverName='auth' selects auth.py via moduleAliasMap.
-  // Runs when multiple candidates survive filtering and the receiver is a known module alias.
-  if (filteredCandidates.length > 1 && call.callForm === 'member' && call.receiverName) {
+  // Module-alias disambiguation: Python `import auth; auth.User()` — receiverName='auth'
+  // selects auth.py via moduleAliasMap. Runs for ALL member calls with a known module alias,
+  // not just ambiguous ones — same-file tier may shadow the correct cross-module target when
+  // the caller defines a function with the same name as the callee (Issue #417).
+  if (call.callForm === 'member' && call.receiverName) {
     const aliasMap = ctx.moduleAliasMap?.get(currentFile);
     if (aliasMap) {
       const moduleFile = aliasMap.get(call.receiverName);
       if (moduleFile) {
         const aliasFiltered = filteredCandidates.filter(c => c.filePath === moduleFile);
-        if (aliasFiltered.length > 0) filteredCandidates = aliasFiltered;
+        if (aliasFiltered.length > 0) {
+          filteredCandidates = aliasFiltered;
+        } else {
+          // Same-file tier returned a local match, but the alias points elsewhere.
+          // Widen to global candidates and filter to the aliased module's file.
+          // Use per-file widenCache to avoid repeated lookupFuzzy for the same
+          // calledName+moduleFile from multiple call sites in the same file.
+          const cacheKey = `${call.calledName}\0${moduleFile}`;
+          let fuzzyDefs = widenCache?.get(cacheKey);
+          if (!fuzzyDefs) {
+            fuzzyDefs = ctx.symbols.lookupFuzzy(call.calledName);
+            widenCache?.set(cacheKey, fuzzyDefs);
+          }
+          const widened = filterCallableCandidates(fuzzyDefs, call.argCount, call.callForm)
+            .filter(c => c.filePath === moduleFile);
+          if (widened.length > 0) filteredCandidates = widened;
+        }
       }
     }
   }
@@ -1200,6 +1241,7 @@ export const processCallsFromExtracted = async (
     }
 
     ctx.enableCache(filePath);
+    const widenCache: WidenCache = new Map();
     const receiverMap = fileReceiverTypes.get(filePath);
 
     for (const call of calls) {
@@ -1253,7 +1295,7 @@ export const processCallsFromExtracted = async (
         }
       }
 
-      const resolved = resolveCallTarget(effectiveCall, effectiveCall.filePath, ctx);
+      const resolved = resolveCallTarget(effectiveCall, effectiveCall.filePath, ctx, undefined, widenCache);
       if (!resolved) continue;
 
       const relId = generateId('CALLS', `${effectiveCall.sourceId}:${effectiveCall.calledName}->${resolved.nodeId}`);
@@ -1404,13 +1446,30 @@ export const processRoutesFromExtracted = async (
  */
 
 /** Common method names on response/data objects that are NOT property accesses */
-const RESPONSE_METHOD_BLOCKLIST = new Set([
-  'json', 'text', 'blob', 'arrayBuffer', 'formData', 'ok', 'status', 'headers',
-  'then', 'catch', 'finally', 'clone',
+// Properties/methods to ignore when extracting consumer accessed keys from `data.X` patterns.
+// Avoids false positives from Fetch API, Array, Object, Promise, and DOM access on variables
+// that happen to share names with response variables (data, result, response, etc.).
+const RESPONSE_ACCESS_BLOCKLIST = new Set([
+  // Fetch/Response API
+  'json', 'text', 'blob', 'arrayBuffer', 'formData', 'ok', 'status', 'headers', 'clone',
+  // Promise
+  'then', 'catch', 'finally',
+  // Array
   'map', 'filter', 'forEach', 'reduce', 'find', 'some', 'every',
-  'length', 'toString', 'valueOf',
   'push', 'pop', 'shift', 'unshift', 'splice', 'slice', 'concat', 'join',
-  'sort', 'reverse', 'includes', 'indexOf', 'keys', 'values', 'entries',
+  'sort', 'reverse', 'includes', 'indexOf',
+  // Object
+  'length', 'toString', 'valueOf', 'keys', 'values', 'entries',
+  // DOM methods — file-download patterns often reuse `data`/`response` variable names
+  'appendChild', 'removeChild', 'insertBefore', 'replaceChild', 'replaceChildren',
+  'createElement', 'getElementById', 'querySelector', 'querySelectorAll',
+  'setAttribute', 'getAttribute', 'removeAttribute', 'hasAttribute',
+  'addEventListener', 'removeEventListener', 'dispatchEvent',
+  'classList', 'className',
+  'parentNode', 'parentElement', 'childNodes', 'children',
+  'nextSibling', 'previousSibling', 'firstChild', 'lastChild',
+  'click', 'focus', 'blur', 'submit', 'reset',
+  'innerHTML', 'outerHTML', 'textContent', 'innerText',
 ]);
 
 export const extractConsumerAccessedKeys = (content: string): string[] => {
@@ -1449,7 +1508,7 @@ export const extractConsumerAccessedKeys = (content: string): string[] => {
   while ((match = propAccessPattern.exec(content)) !== null) {
     const key = match[1];
     // Skip common method calls that aren't property accesses
-    if (!RESPONSE_METHOD_BLOCKLIST.has(key)) {
+    if (!RESPONSE_ACCESS_BLOCKLIST.has(key)) {
       keys.add(key);
     }
   }

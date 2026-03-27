@@ -41,4 +41,7 @@ export enum SupportedLanguages {
     PHP = 'php',
     Kotlin = 'kotlin',
     Swift = 'swift',
+    Dart = 'dart',
+    /** Standalone regex processor — no tree-sitter, no LanguageProvider. */
+    Cobol = 'cobol',
 }

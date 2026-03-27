@@ -21,11 +21,14 @@ const _require = createRequire(import.meta.url);
 let Swift: any = null;
 try { Swift = _require('tree-sitter-swift'); } catch {}
 
+// tree-sitter-dart is an optionalDependency — may not be installed
+let Dart: any = null;
+try { Dart = _require('tree-sitter-dart'); } catch {}
+
 // tree-sitter-kotlin is an optionalDependency — may not be installed
 let Kotlin: any = null;
 try { Kotlin = _require('tree-sitter-kotlin'); } catch {}
 import { getLanguageFromFilename } from '../utils/language-detection.js';
-import { isBuiltInOrNoise } from '../utils/noise-filter.js';
 import {
   FUNCTION_NODE_TYPES,
   extractFunctionName,
@@ -35,6 +38,7 @@ import {
   extractMethodSignature,
   findDescendant,
   extractStringContent,
+  type SyntaxNode,
 } from '../utils/ast-helpers.js';
 import {
   countCallArguments,
@@ -51,8 +55,9 @@ import { JSX_EXTRA_QUERIES } from '../tree-sitter-queries.js';
 import { generateId } from '../../../lib/utils.js';
 import { preprocessImportPath } from '../import-processor.js';
 import type { NamedBinding } from '../named-bindings/types.js';
-import { extractPropertyDeclaredType } from '../type-extractors/shared.js';
 import type { NodeLabel } from '../../graph/types.js';
+import type { FieldInfo, FieldExtractorContext } from '../field-types.js';
+import { CLASS_CONTAINER_TYPES } from '../utils/ast-helpers.js';
 
 // ============================================================================
 // Types for serializable results
@@ -74,6 +79,11 @@ interface ParsedNode {
     parameterCount?: number;
     requiredParameterCount?: number;
     returnType?: string;
+    // Field/property metadata (populated by FieldExtractor)
+    declaredType?: string;
+    visibility?: string;
+    isStatic?: boolean;
+    isReadonly?: boolean;
   };
 }
 
@@ -97,6 +107,9 @@ interface ParsedSymbol {
   returnType?: string;
   declaredType?: string;
   ownerId?: string;
+  visibility?: string;
+  isStatic?: boolean;
+  isReadonly?: boolean;
 }
 
 export interface ExtractedImport {
@@ -260,6 +273,14 @@ export interface FileConstValues {
   objectProps: [string, [string, string][]][];
 }
 
+export interface ExtractedORMQuery {
+  filePath: string;
+  orm: 'prisma' | 'supabase';
+  model: string;
+  method: string;
+  lineNumber: number;
+}
+
 /** Constructor bindings keyed by filePath for cross-file type resolution */
 export interface FileConstructorBindings {
   filePath: string;
@@ -291,6 +312,7 @@ export interface ParseWorkerResult {
   extensionMethods: ExtractedExtensionMethod[];
   contextRefs: ExtractedContextRef[];
   constValues: FileConstValues[];
+  ormQueries: ExtractedORMQuery[];
   constructorBindings: FileConstructorBindings[];
   /** File-scope type bindings from TypeEnv fixpoint for exported symbol collection. */
   typeEnvBindings: FileTypeEnvBindings[];
@@ -323,6 +345,7 @@ const languageMap: Record<string, any> = {
   ...(Kotlin ? { [SupportedLanguages.Kotlin]: Kotlin } : {}),
   [SupportedLanguages.PHP]: PHP.php_only,
   [SupportedLanguages.Ruby]: Ruby,
+  ...(Dart ? { [SupportedLanguages.Dart]: Dart } : {}),
   ...(Swift ? { [SupportedLanguages.Swift]: Swift } : {}),
 };
 
@@ -358,8 +381,6 @@ const setLanguage = (language: SupportedLanguages, filePath: string): void => {
 const classIdCache = new Map<any, string | null>();
 const functionIdCache = new Map<any, string | null>();
 const exportCache = new Map<any, boolean>();
-
-const clearCaches = (): void => { classIdCache.clear(); functionIdCache.clear(); exportCache.clear(); namespaceCache.clear(); };
 
 // ============================================================================
 // Enclosing namespace detection (for C# partial class unification)
@@ -405,6 +426,67 @@ const findEnclosingNamespace = (node: any): string | null => {
   namespaceCache.set(node, null);
   return null;
 };
+// ============================================================================
+// FieldExtractor cache — extract field metadata once per class, reuse for each property.
+// Keyed by class node startIndex (unique per AST node within a file).
+// ============================================================================
+
+const fieldInfoCache = new Map<number, Map<string, FieldInfo>>();
+
+const clearCaches = (): void => { classIdCache.clear(); functionIdCache.clear(); exportCache.clear(); namespaceCache.clear(); fieldInfoCache.clear(); };
+
+/**
+ * Walk up from a definition node to find the nearest enclosing class/struct/interface
+ * AST node. Returns the SyntaxNode itself (not an ID) for passing to FieldExtractor.
+ */
+function findEnclosingClassNode(node: SyntaxNode): SyntaxNode | null {
+  let current = node.parent;
+  while (current) {
+    if (CLASS_CONTAINER_TYPES.has(current.type)) {
+      return current;
+    }
+    current = current.parent;
+  }
+  return null;
+}
+
+/**
+ * Minimal no-op SymbolTable stub for FieldExtractorContext in the worker.
+ * Field extraction only uses symbolTable.lookupExactAll for optional type resolution —
+ * returning [] causes the extractor to use the raw type string, which is fine for us.
+ */
+const NOOP_SYMBOL_TABLE: any = {
+  lookupExactAll: () => [],
+  lookupExact: () => undefined,
+  lookupExactFull: () => undefined,
+};
+
+/**
+ * Get (or extract and cache) field info for a class node.
+ * Returns a name→FieldInfo map, or undefined if the provider has no field extractor
+ * or the class yielded no fields.
+ */
+function getFieldInfo(
+  classNode: SyntaxNode,
+  provider: LanguageProvider,
+  context: FieldExtractorContext,
+): Map<string, FieldInfo> | undefined {
+  if (!provider.fieldExtractor) return undefined;
+
+  const cacheKey = classNode.startIndex;
+  let cached = fieldInfoCache.get(cacheKey);
+  if (cached) return cached;
+
+  const result = provider.fieldExtractor.extract(classNode, context);
+  if (!result?.fields?.length) return undefined;
+
+  cached = new Map<string, FieldInfo>();
+  for (const field of result.fields) {
+    cached.set(field.name, field);
+  }
+  fieldInfoCache.set(cacheKey, cached);
+  return cached;
+}
 
 // ============================================================================
 // Enclosing function detection (for call extraction) — cached
@@ -435,6 +517,23 @@ const findEnclosingFunctionId = (node: any, filePath: string, provider: Language
         return result;
       }
     }
+
+    // Language-specific enclosing function resolution (e.g., Dart where
+    // function_body is a sibling of function_signature, not a child).
+    if (provider.enclosingFunctionFinder) {
+      const customResult = provider.enclosingFunctionFinder(current);
+      if (customResult) {
+        let finalLabel: NodeLabel = customResult.label;
+        if (provider.labelOverride) {
+          const override = provider.labelOverride(current.previousSibling, finalLabel);
+          if (override !== null) finalLabel = override;
+        }
+        const result = generateId(finalLabel, `${filePath}:${customResult.funcName}`);
+        functionIdCache.set(node, result);
+        return result;
+      }
+    }
+
     current = current.parent;
   }
   functionIdCache.set(node, null);
@@ -489,6 +588,7 @@ const processBatch = (files: ParseWorkerInput[], onProgress?: (filesProcessed: n
     extensionMethods: [],
     contextRefs: [],
     constValues: [],
+    ormQueries: [],
     constructorBindings: [],
     typeEnvBindings: [],
     skippedLanguages: {},
@@ -997,6 +1097,53 @@ function extractLaravelRoutes(tree: any, filePath: string): ExtractedRoute[] {
   return routes;
 }
 
+// ============================================================================
+// ORM Query Detection (Prisma + Supabase)
+// ============================================================================
+
+const PRISMA_QUERY_RE = /\bprisma\.(\w+)\.(findMany|findFirst|findUnique|findUniqueOrThrow|findFirstOrThrow|create|createMany|update|updateMany|delete|deleteMany|upsert|count|aggregate|groupBy)\s*\(/g;
+const SUPABASE_QUERY_RE = /\bsupabase\.from\s*\(\s*['"](\w+)['"]\s*\)\s*\.(select|insert|update|delete|upsert)\s*\(/g;
+
+/**
+ * Extract ORM query calls from file content via regex.
+ * Appends results to the provided array (avoids allocation when no matches).
+ */
+export function extractORMQueries(filePath: string, content: string, out: ExtractedORMQuery[]): void {
+  const hasPrisma = content.includes('prisma.');
+  const hasSupabase = content.includes('supabase.from');
+  if (!hasPrisma && !hasSupabase) return;
+
+  if (hasPrisma) {
+    PRISMA_QUERY_RE.lastIndex = 0;
+    let m;
+    while ((m = PRISMA_QUERY_RE.exec(content)) !== null) {
+      const model = m[1];
+      if (model.startsWith('$')) continue;
+      out.push({
+        filePath,
+        orm: 'prisma',
+        model,
+        method: m[2],
+        lineNumber: content.substring(0, m.index).split('\n').length - 1,
+      });
+    }
+  }
+
+  if (hasSupabase) {
+    SUPABASE_QUERY_RE.lastIndex = 0;
+    let m;
+    while ((m = SUPABASE_QUERY_RE.exec(content)) !== null) {
+      out.push({
+        filePath,
+        orm: 'supabase',
+        model: m[1],
+        method: m[2],
+        lineNumber: content.substring(0, m.index).split('\n').length - 1,
+      });
+    }
+  }
+}
+
 const processFileGroup = (
   files: ParseWorkerInput[],
   language: SupportedLanguages,
@@ -1360,8 +1507,8 @@ const processFileGroup = (
     // Build per-file type environment + constructor bindings in a single AST walk.
     // Constructor bindings are verified against the SymbolTable in processCallsFromExtracted.
     const parentMap: ReadonlyMap<string, readonly string[]> = fileParentMap;
-    const typeEnv = buildTypeEnv(tree, language, { parentMap });
     const provider = getProvider(language);
+    const typeEnv = buildTypeEnv(tree, language, { parentMap, enclosingFunctionFinder: provider?.enclosingFunctionFinder });
     const callRouter = provider.callRouter;
 
     if (typeEnv.constructorBindings.length > 0) {
@@ -2121,7 +2268,18 @@ const processFileGroup = (
 
             if (routed.kind === 'properties') {
               const propEnclosingClassId = cachedFindEnclosingClassId(captureMap['call'], file.path);
+              // Enrich routed properties with FieldExtractor metadata
+              let routedFieldMap: Map<string, FieldInfo> | undefined;
+              if (provider.fieldExtractor && typeEnv) {
+                const classNode = findEnclosingClassNode(captureMap['call']);
+                if (classNode) {
+                  routedFieldMap = getFieldInfo(classNode, provider, {
+                    typeEnv, symbolTable: NOOP_SYMBOL_TABLE, filePath: file.path, language,
+                  });
+                }
+              }
               for (const item of routed.items) {
+                const routedFieldInfo = routedFieldMap?.get(item.propName);
                 const nodeId = generateId('Property', `${file.path}:${item.propName}`);
                 result.nodes.push({
                   id: nodeId,
@@ -2134,6 +2292,10 @@ const processFileGroup = (
                     language,
                     isExported: true,
                     description: item.accessorType,
+                    ...(item.declaredType ? { declaredType: item.declaredType } : routedFieldInfo?.type ? { declaredType: routedFieldInfo.type } : {}),
+                    ...(routedFieldInfo?.visibility !== undefined ? { visibility: routedFieldInfo.visibility } : {}),
+                    ...(routedFieldInfo?.isStatic !== undefined ? { isStatic: routedFieldInfo.isStatic } : {}),
+                    ...(routedFieldInfo?.isReadonly !== undefined ? { isReadonly: routedFieldInfo.isReadonly } : {}),
                   },
                 });
                 result.symbols.push({
@@ -2142,7 +2304,10 @@ const processFileGroup = (
                   nodeId,
                   type: 'Property',
                   ...(propEnclosingClassId ? { ownerId: propEnclosingClassId } : {}),
-                  ...(item.declaredType ? { declaredType: item.declaredType } : {}),
+                  ...(item.declaredType ? { declaredType: item.declaredType } : routedFieldInfo?.type ? { declaredType: routedFieldInfo.type } : {}),
+                  ...(routedFieldInfo?.visibility !== undefined ? { visibility: routedFieldInfo.visibility } : {}),
+                  ...(routedFieldInfo?.isStatic !== undefined ? { isStatic: routedFieldInfo.isStatic } : {}),
+                  ...(routedFieldInfo?.isReadonly !== undefined ? { isReadonly: routedFieldInfo.isReadonly } : {}),
                 });
                 const fileId = generateId('File', file.path);
                 const relId = generateId('DEFINES', `${fileId}->${nodeId}`);
@@ -2171,7 +2336,7 @@ const processFileGroup = (
             // kind === 'call' — fall through to normal call processing below
           }
 
-          if (!isBuiltInOrNoise(calledName)) {
+          if (!provider.isBuiltInName(calledName)) {
             const callNode = captureMap['call'];
             const sourceId = findEnclosingFunctionId(callNode, file.path, provider)
               || generateId('File', file.path);
@@ -2309,6 +2474,9 @@ const processFileGroup = (
       let parameterTypes: string[] | undefined;
       let returnType: string | undefined;
       let declaredType: string | undefined;
+      let visibility: string | undefined;
+      let isStatic: boolean | undefined;
+      let isReadonly: boolean | undefined;
       if (nodeLabel === 'Function' || nodeLabel === 'Method' || nodeLabel === 'Constructor') {
         const sig = extractMethodSignature(definitionNode);
         parameterCount = sig.parameterCount;
@@ -2326,9 +2494,22 @@ const processFileGroup = (
           }
         }
       } else if (nodeLabel === 'Property' && definitionNode) {
-        // Extract the declared type for property/field nodes.
-        // Walk the definition node for type annotation children.
-        declaredType = extractPropertyDeclaredType(definitionNode);
+        // FieldExtractor is the single source of truth when available
+        if (provider.fieldExtractor && typeEnv) {
+          const classNode = findEnclosingClassNode(definitionNode);
+          if (classNode) {
+            const fieldMap = getFieldInfo(classNode, provider, {
+              typeEnv, symbolTable: NOOP_SYMBOL_TABLE, filePath: file.path, language,
+            });
+            const info = fieldMap?.get(nodeName);
+            if (info) {
+              declaredType = info.type ?? undefined;
+              visibility = info.visibility;
+              isStatic = info.isStatic;
+              isReadonly = info.isReadonly;
+            }
+          }
+        }
       }
 
       result.nodes.push({
@@ -2369,6 +2550,11 @@ const processFileGroup = (
                   return isAsync ? { isAsync: true } : {};
                 })()
               : {}),
+          ...(returnType !== undefined ? { returnType } : {}),
+          ...(declaredType !== undefined ? { declaredType } : {}),
+          ...(visibility !== undefined ? { visibility } : {}),
+          ...(isStatic !== undefined ? { isStatic } : {}),
+          ...(isReadonly !== undefined ? { isReadonly } : {}),
         },
       });
 
@@ -2388,6 +2574,9 @@ const processFileGroup = (
         ...(returnType !== undefined ? { returnType } : {}),
         ...(declaredType !== undefined ? { declaredType } : {}),
         ...(enclosingClassId ? { ownerId: enclosingClassId } : {}),
+        ...(visibility !== undefined ? { visibility } : {}),
+        ...(isStatic !== undefined ? { isStatic } : {}),
+        ...(isReadonly !== undefined ? { isReadonly } : {}),
       });
 
       const fileId = generateId('File', file.path);
@@ -2704,6 +2893,8 @@ const processFileGroup = (
         }
       }
     }
+    // Extract ORM queries (Prisma, Supabase)
+    extractORMQueries(file.path, file.content, result.ormQueries);
   }
 };
 
@@ -2714,7 +2905,7 @@ const processFileGroup = (
 /** Accumulated result across sub-batches */
 let accumulated: ParseWorkerResult = {
   nodes: [], relationships: [], symbols: [],
-  imports: [], calls: [], assignments: [], heritage: [], routes: [], fetchCalls: [], decoratorRoutes: [], toolDefs: [], channels: [], eventRefs: [], overrides: [], extensionMethods: [], contextRefs: [], constValues: [], constructorBindings: [], typeEnvBindings: [], skippedLanguages: {}, fileCount: 0,
+  imports: [], calls: [], assignments: [], heritage: [], routes: [], fetchCalls: [], decoratorRoutes: [], toolDefs: [], channels: [], eventRefs: [], overrides: [], extensionMethods: [], contextRefs: [], constValues: [], ormQueries: [], constructorBindings: [], typeEnvBindings: [], skippedLanguages: {}, fileCount: 0,
 };
 let cumulativeProcessed = 0;
 
@@ -2736,6 +2927,7 @@ const mergeResult = (target: ParseWorkerResult, src: ParseWorkerResult) => {
   target.extensionMethods.push(...src.extensionMethods);
   target.contextRefs.push(...src.contextRefs);
   target.constValues.push(...src.constValues);
+  target.ormQueries.push(...src.ormQueries);
   target.constructorBindings.push(...src.constructorBindings);
   target.typeEnvBindings.push(...src.typeEnvBindings);
   for (const [lang, count] of Object.entries(src.skippedLanguages)) {
@@ -2762,7 +2954,7 @@ parentPort!.on('message', (msg: any) => {
     if (msg && msg.type === 'flush') {
       parentPort!.postMessage({ type: 'result', data: accumulated });
       // Reset for potential reuse
-      accumulated = { nodes: [], relationships: [], symbols: [], imports: [], calls: [], assignments: [], heritage: [], routes: [], fetchCalls: [], decoratorRoutes: [], toolDefs: [], channels: [], eventRefs: [], overrides: [], extensionMethods: [], contextRefs: [], constValues: [], constructorBindings: [], typeEnvBindings: [], skippedLanguages: {}, fileCount: 0 };
+      accumulated = { nodes: [], relationships: [], symbols: [], imports: [], calls: [], assignments: [], heritage: [], routes: [], fetchCalls: [], decoratorRoutes: [], toolDefs: [], channels: [], eventRefs: [], overrides: [], extensionMethods: [], contextRefs: [], constValues: [], ormQueries: [], constructorBindings: [], typeEnvBindings: [], skippedLanguages: {}, fileCount: 0 };
       cumulativeProcessed = 0;
       return;
     }

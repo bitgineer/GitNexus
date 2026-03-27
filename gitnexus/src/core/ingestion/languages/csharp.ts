@@ -13,6 +13,29 @@ import { csharpExportChecker } from '../export-detection.js';
 import { resolveCSharpImport } from '../import-resolvers/csharp.js';
 import { extractCSharpNamedBindings } from '../named-bindings/csharp.js';
 import { CSHARP_QUERIES } from '../tree-sitter-queries.js';
+import { createFieldExtractor } from '../field-extractors/generic.js';
+import { csharpConfig as csharpFieldConfig } from '../field-extractors/configs/csharp.js';
+
+const BUILT_INS: ReadonlySet<string> = new Set([
+  'Console', 'WriteLine', 'ReadLine', 'Write',
+  'Task', 'Run', 'Wait', 'WhenAll', 'WhenAny', 'FromResult', 'Delay', 'ContinueWith',
+  'ConfigureAwait', 'GetAwaiter', 'GetResult',
+  'ToString', 'GetType', 'Equals', 'GetHashCode', 'ReferenceEquals',
+  'Add', 'Remove', 'Contains', 'Clear', 'Count', 'Any', 'All',
+  'Where', 'Select', 'SelectMany', 'OrderBy', 'OrderByDescending', 'GroupBy',
+  'First', 'FirstOrDefault', 'Single', 'SingleOrDefault', 'Last', 'LastOrDefault',
+  'ToList', 'ToArray', 'ToDictionary', 'AsEnumerable', 'AsQueryable',
+  'Aggregate', 'Sum', 'Average', 'Min', 'Max', 'Distinct', 'Skip', 'Take',
+  'String', 'Format', 'IsNullOrEmpty', 'IsNullOrWhiteSpace', 'Concat', 'Join',
+  'Trim', 'TrimStart', 'TrimEnd', 'Split', 'Replace', 'StartsWith', 'EndsWith',
+  'Convert', 'ToInt32', 'ToDouble', 'ToBoolean', 'ToByte',
+  'Math', 'Abs', 'Ceiling', 'Floor', 'Round', 'Pow', 'Sqrt',
+  'Dispose', 'Close',
+  'TryParse', 'Parse',
+  'AddRange', 'RemoveAt', 'RemoveAll', 'FindAll', 'Exists', 'TrueForAll',
+  'ContainsKey', 'TryGetValue', 'AddOrUpdate',
+  'Throw', 'ThrowIfNull',
+]);
 
 export const csharpProvider = defineLanguage({
   id: SupportedLanguages.CSharp,
@@ -24,4 +47,6 @@ export const csharpProvider = defineLanguage({
   namedBindingExtractor: extractCSharpNamedBindings,
   interfaceNamePattern: /^I[A-Z]/,
   mroStrategy: 'implements-split',
+  fieldExtractor: createFieldExtractor(csharpFieldConfig),
+  builtInNames: BUILT_INS,
 });

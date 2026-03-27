@@ -60,11 +60,12 @@ describe('Java heritage resolution', () => {
     expect(extends_.some(e => e.target === 'Validatable')).toBe(false);
   });
 
-  it('emits exactly 2 CALLS edges', () => {
+  it('emits exactly 3 CALLS edges', () => {
     const calls = getRelationships(result, 'CALLS');
-    expect(calls.length).toBe(2);
+    expect(calls.length).toBe(3);
     expect(edgeSet(calls)).toEqual([
       'processUser → save',
+      'processUser → serialize',
       'processUser → validate',
     ]);
   });
@@ -1117,6 +1118,22 @@ describe('Field type resolution (Java)', () => {
     expect(addressReads.length).toBe(1);
     expect(addressReads[0].source).toBe('processUser');
     expect(addressReads[0].targetLabel).toBe('Property');
+  });
+
+  it('populates field metadata (visibility, isStatic, declaredType) on Property nodes', () => {
+    const properties = getNodesByLabelFull(result, 'Property');
+
+    const city = properties.find(p => p.name === 'city');
+    expect(city).toBeDefined();
+    expect(city!.properties.visibility).toBe('public');
+    expect(city!.properties.isStatic).toBe(false);
+    expect(city!.properties.isReadonly).toBe(false);
+    expect(city!.properties.declaredType).toBe('String');
+
+    const addr = properties.find(p => p.name === 'address');
+    expect(addr).toBeDefined();
+    expect(addr!.properties.visibility).toBe('public');
+    expect(addr!.properties.declaredType).toBe('Address');
   });
 });
 

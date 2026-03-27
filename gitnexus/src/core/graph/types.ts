@@ -71,6 +71,11 @@ export type NodeProperties = {
   // Section-specific (markdown heading level, 1-6)
   level?: number,
   returnType?: string,
+  // Field/property metadata (populated by FieldExtractor)
+  declaredType?: string,
+  visibility?: string,       // 'public' | 'private' | 'protected' | 'internal' etc.
+  isStatic?: boolean,
+  isReadonly?: boolean,
   // Response shape (top-level keys from NextResponse.json({...}) / res.json({...}))
   responseKeys?: string[],
   // Error response shape (top-level keys from .json() calls with status >= 400)
@@ -104,6 +109,7 @@ export type RelationshipType =
   | 'HANDLES_TOOL'   // Function/File → Tool (handler implements this tool)
   | 'ENTRY_POINT_OF'  // Route/Tool → Process (this endpoint starts this execution flow)
   | 'WRAPS'           // Function → Function (middleware wrapper chain) — Reserved: future middleware graph traversal (not yet emitted)
+  | 'QUERIES'          // File/Function → CodeElement (ORM query to model/table)
 
 export interface GraphNode {
   id:  string,
@@ -144,4 +150,5 @@ export interface KnowledgeGraph {
   addRelationship: (relationship: GraphRelationship) => void,
   removeNode: (nodeId: string) => boolean,
   removeNodesByFile: (filePath: string) => number,
+  removeRelationship: (relationshipId: string) => boolean,
 }
