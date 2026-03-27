@@ -223,6 +223,14 @@ async function getContextResource(backend: LocalBackend, repoName?: string): Pro
   lines.push('  - rename: Multi-file coordinated rename with confidence tags');
   lines.push('  - cypher: Raw graph queries');
   lines.push('  - list_repos: Discover all indexed repositories');
+  lines.push('  - cross_repo_channels: Cross-repo message flow matching (requires `gitnexus link` first)');
+  lines.push('');
+  lines.push('cli_commands:');
+  lines.push('  - gitnexus analyze [path]: Index a repository (--force to re-index, --context for AI files)');
+  lines.push('  - gitnexus link: Build cross-repo channel registry (run after indexing all repos)');
+  lines.push('  - gitnexus list: List all indexed repositories');
+  lines.push('  - gitnexus status: Show index status for current repo');
+  lines.push('  - gitnexus clean: Delete index for current repo');
   lines.push('');
   lines.push('re_index: Run `npx gitnexus analyze` in terminal if data is stale');
   lines.push('');
@@ -471,6 +479,7 @@ async function getSetupResource(backend: LocalBackend): Promise<string> {
       '| `rename` | Multi-file coordinated rename with confidence-tagged edits |',
       '| `cypher` | Raw graph queries |',
       '| `list_repos` | Discover indexed repos |',
+      '| `cross_repo_channels` | Cross-repo message flow matching — which services talk to which via shared channel names |',
       '',
       '## Resources',
       '',

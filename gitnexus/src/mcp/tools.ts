@@ -295,4 +295,33 @@ Returns: single route object when one match, or { routes: [...], total: N } for 
       required: [],
     },
   },
+  {
+    name: 'cross_repo_channels',
+    description: `Show cross-repo message channel matches — which services communicate via shared channel names.
+
+Reads the cross-repo channel registry built by \`gitnexus link\`. Shows producers and consumers
+for each channel across all indexed repos, enabling cross-service message flow tracing.
+
+WHEN TO USE: Understanding cross-service communication. "What messages does service A send to service B?"
+"Which repos handle this event?" "Show me the full request/response flow across services."
+REQUIRES: Run \`gitnexus link\` first to build the registry after indexing repos.
+AFTER THIS: Use context() on specific handler functions to see their implementation details.
+
+Returns: matched channels with producer repos, consumer repos, and endpoint details.
+Filters by channel name pattern or repo name when provided.`,
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        channel: {
+          type: 'string',
+          description: 'Filter by channel name (partial match). E.g., "auth" or "UserCreated".',
+        },
+        repo: {
+          type: 'string',
+          description: 'Filter to channels involving a specific repo. E.g., "my-service".',
+        },
+      },
+      required: [],
+    },
+  },
 ];

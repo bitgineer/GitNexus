@@ -25,6 +25,8 @@ export interface PipelineResult {
   totalFileCount: number;
   communityResult?: CommunityDetectionResult;
   processResult?: ProcessDetectionResult;
+  /** All extracted channel references (matched and unmatched) for cross-repo linking */
+  allChannels?: { channelName: string; role: 'producer' | 'consumer'; transport: string; enclosingSymbolId: string; filePath: string; lineNumber: number }[];
 }
 
 // Serializable version for Web Worker communication
