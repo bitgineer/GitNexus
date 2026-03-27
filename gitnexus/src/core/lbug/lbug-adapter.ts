@@ -18,6 +18,36 @@ let conn: lbug.Connection | null = null;
 let currentDbPath: string | null = null;
 let ftsLoaded = false;
 
+/**
+ * Retry wrapper for filesystem and DB operations that may fail due to
+ * WSL I/O transient errors (EIO, ENOENT on /mnt/c/).
+ * Retries up to `maxRetries` times with exponential backoff.
+ */
+const withRetry = async <T>(
+  operation: () => Promise<T>,
+  label: string,
+  maxRetries = 3,
+  baseDelayMs = 500,
+): Promise<T> => {
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await operation();
+    } catch (err: any) {
+      const code = err?.code ?? '';
+      const isTransient = code === 'EIO' || code === 'ENOENT' || code === 'EAGAIN' || code === 'EBUSY'
+        || (err?.message?.includes?.('i/o error') ?? false)
+        || (err?.message?.includes?.('Reading past the end') ?? false);
+      if (!isTransient || attempt === maxRetries) throw err;
+      const delay = baseDelayMs * Math.pow(2, attempt);
+      if (process.env.GITNEXUS_VERBOSE) {
+        console.warn(`⚠️ ${label}: transient I/O error (${code || err?.message?.slice(0, 40)}), retry ${attempt + 1}/${maxRetries} in ${delay}ms`);
+      }
+      await new Promise(r => setTimeout(r, delay));
+    }
+  }
+  throw new Error(`${label}: unreachable`);
+};
+
 /** Expose the current Database for pool adapter reuse in tests. */
 export const getDatabase = (): lbug.Database | null => db;
 
@@ -186,7 +216,13 @@ export const loadGraphToLbug = async (
 
   const log = onProgress || (() => {});
 
-  const csvDir = path.join(storagePath, 'csv');
+  // Use /tmp for CSV staging when the target is on a non-native filesystem (e.g., /mnt/c/ in WSL).
+  // This avoids transient EIO errors during heavy writes to NTFS via Plan 9.
+  const isNonNativeFs = storagePath.startsWith('/mnt/');
+  const stagingDir = isNonNativeFs
+    ? path.join('/tmp', `gitnexus-staging-${Date.now()}`)
+    : storagePath;
+  const csvDir = path.join(stagingDir, 'csv');
 
   log('Streaming CSVs to disk...');
   const csvResult = await streamAllCSVsToDisk(graph, repoPath, csvDir);
@@ -268,7 +304,7 @@ export const loadGraphToLbug = async (
       pairIdx++;
       const [fromLabel, toLabel] = pairKey.split('|');
       const pairCsvPath = path.join(csvDir, `rel_${fromLabel}_${toLabel}.csv`);
-      await fs.writeFile(pairCsvPath, relHeader + '\n' + lines.join('\n'), 'utf-8');
+      await withRetry(() => fs.writeFile(pairCsvPath, relHeader + '\n' + lines.join('\n'), 'utf-8'), `CSV write ${fromLabel}->${toLabel}`);
       const normalizedPath = normalizeCopyPath(pairCsvPath);
       const copyQuery = `COPY ${REL_TABLE_NAME} FROM "${normalizedPath}" (from="${fromLabel}", to="${toLabel}", HEADER=true, ESCAPE='"', DELIM=',', QUOTE='"', PARALLEL=false, auto_detect=false)`;
 
@@ -313,6 +349,11 @@ export const loadGraphToLbug = async (
     }
   } catch {}
   try { await fs.rmdir(csvDir); } catch {}
+
+  // Clean up staging directory if we used /tmp
+  if (isNonNativeFs && stagingDir !== storagePath) {
+    try { await fs.rm(stagingDir, { recursive: true, force: true }); } catch {}
+  }
 
   return { success: true, insertedRels, skippedRels, warnings };
 };

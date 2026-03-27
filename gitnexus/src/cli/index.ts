@@ -126,6 +126,11 @@ program
   .option('-r, --repo <name>', 'Target repository')
   .action(createLazyAction(() => import('./tool.js'), 'cypherCommand'));
 
+program
+  .command('verify')
+  .description('Health check all indexed repos — detect corrupted databases')
+  .action(createLazyAction(() => import('./verify.js'), 'verifyCommand'));
+
 // ─── Cross-Repo Linking ─────────────────────────────────────────────
 
 program

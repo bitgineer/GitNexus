@@ -120,8 +120,16 @@ export const linkCommand = async (): Promise<void> => {
         }
       }
     } catch {
-      // No channels.json — repo was indexed before channel support, or has no channels
-      console.log(`  · ${repo.name}: no channel manifest (re-index to generate)`);
+      // No channels.json — check if the repo was indexed (has meta.json) to distinguish
+      // "no channels detected" from "needs re-index with newer build"
+      const metaPath = path.join(repo.storagePath, 'meta.json');
+      let hasIndex = false;
+      try { await fs.access(metaPath); hasIndex = true; } catch {}
+      if (hasIndex) {
+        console.log(`  · ${repo.name}: no channels detected`);
+      } else {
+        console.log(`  ⚠ ${repo.name}: not indexed — run gitnexus analyze`);
+      }
     }
   }
 

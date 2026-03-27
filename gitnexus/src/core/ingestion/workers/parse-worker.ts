@@ -52,6 +52,15 @@ import { buildTypeEnv } from '../type-env.js';
 import type { ConstructorBinding } from '../type-env.js';
 import { detectFrameworkFromAST } from '../framework-detection.js';
 import { JSX_EXTRA_QUERIES } from '../tree-sitter-queries.js';
+
+/** Channel names to skip — lifecycle events and process signals, not real message channels */
+const SKIP_CHANNEL_NAMES = new Set([
+  'connect', 'disconnect', 'error', 'connection', 'close', 'open', 'listening',
+  'SIGINT', 'SIGTERM', 'SIGKILL', 'SIGHUP', 'SIGBREAK', 'SIGUSR1', 'SIGUSR2',
+  'exit', 'beforeExit', 'warning', 'message', 'rejectionHandled',
+  'uncaughtException', 'uncaughtExceptionMonitor', 'unhandledRejection',
+  'multipleResolves', 'worker',
+]);
 import { generateId } from '../../../lib/utils.js';
 import { preprocessImportPath } from '../import-processor.js';
 import type { NamedBinding } from '../named-bindings/types.js';
@@ -1674,7 +1683,7 @@ const processFileGroup = (
       if (captureMap['channel.consumer.socket'] && captureMap['channel.name']) {
         const channelName = captureMap['channel.name'].text;
         // Skip built-in socket lifecycle events that aren't message channels
-        if (channelName !== 'connect' && channelName !== 'disconnect' && channelName !== 'error' && channelName !== 'connection') {
+        if (!SKIP_CHANNEL_NAMES.has(channelName)) {
           const enclosingId = findEnclosingFunctionId(captureMap['channel.consumer.socket'], file.path, provider) ?? generateId('File', file.path);
           const objName = captureMap['channel.object']?.text ?? '';
           const transport = (objName === 'socket' || objName === 'io') ? 'socket.io' as const : 'event-emitter' as const;
@@ -1733,7 +1742,7 @@ const processFileGroup = (
           const objName = captureMap['channel.object']?.text ?? '';
           const transport = (objName === 'socket' || objName === 'io') ? 'socket.io' as const : 'event-emitter' as const;
           // Skip lifecycle events
-          if (channelName !== 'connect' && channelName !== 'disconnect' && channelName !== 'error' && channelName !== 'connection') {
+          if (!SKIP_CHANNEL_NAMES.has(channelName)) {
             result.channels.push({
               filePath: file.path, channelName,
               role: isConsumer ? 'consumer' : 'producer',
@@ -1761,7 +1770,7 @@ const processFileGroup = (
         const objName = captureMap['channel.object']?.text ?? '';
         // For chained calls like getIO().on(OBJ.PROP), channel.object is absent — default to socket.io
         const transport = (!objName || objName === 'socket' || objName === 'io') ? 'socket.io' as const : 'event-emitter' as const;
-        if (channelName !== 'connect' && channelName !== 'disconnect' && channelName !== 'error' && channelName !== 'connection') {
+        if (!SKIP_CHANNEL_NAMES.has(channelName)) {
           result.channels.push({
             filePath: file.path, channelName,
             role: isConsumer ? 'consumer' : 'producer',
@@ -1824,7 +1833,7 @@ const processFileGroup = (
       // Python Socket.IO / EventEmitter: obj.emit('event') or obj.on('event')
       if ((captureMap['channel.producer.py'] || captureMap['channel.consumer.py']) && captureMap['channel.name']) {
         const channelName = captureMap['channel.name'].text;
-        if (channelName !== 'connect' && channelName !== 'disconnect' && channelName !== 'error' && channelName !== 'connection') {
+        if (!SKIP_CHANNEL_NAMES.has(channelName)) {
           const isProducer = !!captureMap['channel.producer.py'];
           const anchorNode = captureMap['channel.producer.py'] ?? captureMap['channel.consumer.py'];
           const enclosingId = findEnclosingFunctionId(anchorNode, file.path, provider) ?? generateId('File', file.path);
@@ -1843,7 +1852,7 @@ const processFileGroup = (
       // Python decorator listener: @socketio.on('event')
       if (captureMap['channel.consumer.py.decorator'] && captureMap['channel.name']) {
         const channelName = captureMap['channel.name'].text;
-        if (channelName !== 'connect' && channelName !== 'disconnect' && channelName !== 'error' && channelName !== 'connection') {
+        if (!SKIP_CHANNEL_NAMES.has(channelName)) {
           const enclosingId = findEnclosingFunctionId(captureMap['channel.consumer.py.decorator'], file.path, provider) ?? generateId('File', file.path);
           const objName = (captureMap['channel.py.deco.object']?.text ?? '').toLowerCase();
           const transport = (objName.includes('socket') || objName.includes('sio') || objName === 'socketio')
@@ -1860,7 +1869,7 @@ const processFileGroup = (
       // Python @sio.event / @socketio.event — event name = function name
       if (captureMap['channel.consumer.py.event'] && captureMap['channel.name']) {
         const channelName = captureMap['channel.name'].text;
-        if (channelName !== 'connect' && channelName !== 'disconnect' && channelName !== 'error' && channelName !== 'connection') {
+        if (!SKIP_CHANNEL_NAMES.has(channelName)) {
           const enclosingId = findEnclosingFunctionId(captureMap['channel.consumer.py.event'], file.path, provider) ?? generateId('File', file.path);
           const objName = (captureMap['channel.py.event.object']?.text ?? '').toLowerCase();
           const transport = (objName.includes('socket') || objName.includes('sio') || objName === 'socketio')
@@ -1878,7 +1887,7 @@ const processFileGroup = (
       if ((captureMap['channel.producer.py.var'] || captureMap['channel.consumer.py.var']) && captureMap['channel.name.var']) {
         const varName = captureMap['channel.name.var'].text;
         const channelName = constValueMap.get(varName);
-        if (channelName && channelName !== 'connect' && channelName !== 'disconnect' && channelName !== 'error') {
+        if (channelName && !SKIP_CHANNEL_NAMES.has(channelName)) {
           const isProducer = !!captureMap['channel.producer.py.var'];
           const anchorNode = captureMap['channel.producer.py.var'] ?? captureMap['channel.consumer.py.var'];
           const enclosingId = findEnclosingFunctionId(anchorNode, file.path, provider) ?? generateId('File', file.path);
